@@ -1,0 +1,20 @@
+name: Notify Platform
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  notify:
+    name: Notify platform to update ai-service
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Dispatch platform update
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.PLATFORM_UPDATE_TOKEN }}
+          repository: DarqPL/learne-platform
+          event-type: submodule-updated
+          client-payload: '{"submodule":"ai-service","branch":"main"}'
