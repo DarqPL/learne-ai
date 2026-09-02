@@ -1,12 +1,14 @@
-# Environment files
+.git
+.github
 .env
 .env.*
 !.env.example
 !.env.*.example
-
-# Python artifacts
+.venv
+venv
 __pycache__/
-*.py[cod]
 .pytest_cache/
-.venv/
-venv/
+*.pyc
+*.pyo
+*.pyd
+tests/
