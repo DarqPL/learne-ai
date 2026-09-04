@@ -30,6 +30,28 @@ Input:
 """
 
 
+def build_course_recommendation_prompt(payload):
+    return f"""You are an AI tutor recommending courses from placement test results.
+
+Return only valid JSON with this shape:
+{{
+  "weaknesses": ["short weakness label"],
+  "recommendations": [
+    {{"courseId": 123, "score": 0.0, "reason": "short reason"}}
+  ]
+}}
+
+Rules:
+- courseId must be a number from constraints.allowedCourseIds. Do not return courseId as a string.
+- score must be a number from 0 to 1.
+- Return multiple courses when multiple weaknesses map to different courses.
+- Do not include markdown, commentary, or extra keys.
+
+Input:
+{json.dumps(payload, ensure_ascii=False)}
+"""
+
+
 def parse_json_response(text):
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Gemini response was empty")
@@ -65,6 +87,31 @@ def _validate_payload(payload):
     return None
 
 
+def _validate_course_payload(payload):
+    if not isinstance(payload, dict):
+        return "Request body must be a JSON object"
+
+    candidate_courses = payload.get("candidateCourses")
+    if not isinstance(candidate_courses, list):
+        return "candidateCourses must be an array"
+    if not candidate_courses:
+        return "candidateCourses must be a non-empty array"
+
+    constraints = payload.get("constraints")
+    if not isinstance(constraints, dict):
+        return "constraints must be an object"
+
+    allowed_course_ids = constraints.get("allowedCourseIds")
+    if not isinstance(allowed_course_ids, list):
+        return "constraints.allowedCourseIds must be an array"
+    if not allowed_course_ids:
+        return "constraints.allowedCourseIds must be a non-empty array"
+    if any(isinstance(course_id, bool) or not isinstance(course_id, (int, float)) for course_id in allowed_course_ids):
+        return "constraints.allowedCourseIds must contain only numbers"
+
+    return None
+
+
 def _filter_learning_path(parsed, allowed_lesson_ids):
     allowed = {(type(lesson_id), lesson_id) for lesson_id in allowed_lesson_ids}
     seen = set()
@@ -94,6 +141,51 @@ def _filter_learning_path(parsed, allowed_lesson_ids):
                 "lessonId": lesson_id,
                 "score": score,
                 "reason": reason.strip() or DEFAULT_RECOMMENDATION_REASON,
+            }
+        )
+
+    weaknesses = parsed.get("weaknesses", [])
+    if not isinstance(weaknesses, list):
+        weaknesses = []
+
+    return {
+        "weaknesses": [weakness for weakness in weaknesses if isinstance(weakness, str)],
+        "recommendations": recommendations,
+    }
+
+
+def _filter_course_recommendations(parsed, allowed_course_ids):
+    allowed = set(allowed_course_ids)
+    seen = set()
+    recommendations = []
+
+    for item in parsed.get("recommendations", []):
+        if not isinstance(item, dict):
+            continue
+
+        course_id = item.get("courseId")
+        score = item.get("score")
+        reason = item.get("reason")
+        if (
+            isinstance(course_id, bool)
+            or not isinstance(course_id, (int, float))
+            or course_id not in allowed
+            or course_id in seen
+            or isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or score < 0
+            or score > 1
+            or not isinstance(reason, str)
+            or not reason.strip()
+        ):
+            continue
+
+        seen.add(course_id)
+        recommendations.append(
+            {
+                "courseId": course_id,
+                "score": score,
+                "reason": reason.strip(),
             }
         )
 
@@ -151,6 +243,44 @@ def create_app():
             return jsonify({"error": "Gemini returned no valid recommendations"}), 502
 
         return jsonify(learning_path)
+
+    @app.post("/course-recommendations/generate")
+    def generate_course_recommendations():
+        payload = request.get_json(silent=True)
+        if payload is None:
+            return jsonify({"error": "Request body must be valid JSON"}), 400
+
+        validation_error = _validate_course_payload(payload)
+        if validation_error:
+            return jsonify({"error": validation_error}), 400
+
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            return jsonify({"error": "GEMINI_API_KEY is required for generation"}), 503
+
+        prompt = build_course_recommendation_prompt(payload)
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+
+        try:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            parsed = parse_json_response(getattr(response, "text", ""))
+        except json.JSONDecodeError as exc:
+            return jsonify({"error": f"Gemini returned invalid JSON: {exc.msg}"}), 502
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 502
+        except Exception as exc:
+            return jsonify({"error": "Gemini generation failed"}), 502
+
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("recommendations"), list):
+            return jsonify({"error": "Gemini returned invalid response shape"}), 502
+
+        course_recommendations = _filter_course_recommendations(parsed, payload["constraints"]["allowedCourseIds"])
+        if not course_recommendations["recommendations"]:
+            return jsonify({"error": "Gemini returned no valid recommendations"}), 502
+
+        return jsonify(course_recommendations)
 
     return app
 
