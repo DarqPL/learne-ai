@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+import app as ai_app
 from app import build_learning_path_prompt, create_app, parse_json_response
 
 
@@ -43,6 +44,16 @@ def test_prompt_requires_numeric_lesson_id():
     assert "Do not return lessonId as a string" in prompt
 
 
+def test_course_recommendation_prompt_requires_numeric_course_id_and_multiple_courses():
+    prompt = ai_app.build_course_recommendation_prompt({"constraints": {"allowedCourseIds": [10, 11]}})
+
+    assert '"courseId": 123' in prompt
+    assert "courseId must be a number from constraints.allowedCourseIds" in prompt
+    assert "Do not return courseId as a string" in prompt
+    assert "Return multiple courses when multiple weaknesses map to different courses" in prompt
+    assert "Do not include markdown, commentary, or extra keys" in prompt
+
+
 def test_generate_rejects_invalid_candidate_payload(client):
     response = client.post(
         "/learning-path/generate",
@@ -51,6 +62,26 @@ def test_generate_rejects_invalid_candidate_payload(client):
 
     assert response.status_code == 400
     assert "candidateLessons" in response.get_json()["error"]
+
+
+def test_generate_course_recommendations_rejects_invalid_payload(client):
+    response = client.post(
+        "/course-recommendations/generate",
+        json={"candidateCourses": [], "constraints": {"allowedCourseIds": [10]}},
+    )
+
+    assert response.status_code == 400
+    assert "candidateCourses" in response.get_json()["error"]
+
+
+def test_generate_course_recommendations_rejects_non_numeric_allowed_ids(client):
+    response = client.post(
+        "/course-recommendations/generate",
+        json={"candidateCourses": [{"courseId": 10}], "constraints": {"allowedCourseIds": ["10"]}},
+    )
+
+    assert response.status_code == 400
+    assert "constraints.allowedCourseIds" in response.get_json()["error"]
 
 
 @pytest.mark.parametrize(
@@ -133,6 +164,77 @@ def test_generate_filters_invalid_and_duplicate_recommendations(client, monkeypa
             },
         ],
     }
+
+
+def test_generate_course_recommendations_filters_invalid_and_duplicate_courses(client, monkeypatch):
+    class FakeResponse:
+        text = json.dumps(
+            {
+                "weaknesses": ["present simple"],
+                "recommendations": [
+                    {"courseId": 10, "score": 0.94, "reason": "Grammar fit"},
+                    {"courseId": "10", "score": 0.9, "reason": "Wrong type"},
+                    {"courseId": 10, "score": 0.8, "reason": "Duplicate"},
+                    {"courseId": 11, "score": 2, "reason": "Bad score"},
+                    {"courseId": 12, "score": 0.7, "reason": "Not allowed"},
+                ],
+            }
+        )
+
+    class FakeModel:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def generate_content(self, prompt):
+            return FakeResponse()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
+    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+
+    response = client.post(
+        "/course-recommendations/generate",
+        json={
+            "candidateCourses": [{"courseId": 10, "title": "Grammar"}, {"courseId": 11, "title": "Vocabulary"}],
+            "constraints": {"allowedCourseIds": [10, 11]},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "weaknesses": ["present simple"],
+        "recommendations": [{"courseId": 10, "score": 0.94, "reason": "Grammar fit"}],
+    }
+
+
+@pytest.mark.parametrize("recommendations", [None, {"courseId": 10}, "bad"])
+def test_generate_course_recommendations_returns_bad_gateway_for_malformed_recommendations(
+    client, monkeypatch, recommendations
+):
+    class FakeResponse:
+        text = json.dumps({"weaknesses": ["present simple"], "recommendations": recommendations})
+
+    class FakeModel:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def generate_content(self, prompt):
+            return FakeResponse()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
+    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+
+    response = client.post(
+        "/course-recommendations/generate",
+        json={
+            "candidateCourses": [{"courseId": 10, "title": "Grammar"}],
+            "constraints": {"allowedCourseIds": [10]},
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.get_json() == {"error": "Gemini returned invalid response shape"}
 
 
 def test_generate_returns_bad_gateway_when_filtering_removes_all_recommendations(client, monkeypatch):

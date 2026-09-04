@@ -4,7 +4,7 @@ Flask service for AI-assisted learning path generation.
 
 ## Environment
 
-- `GEMINI_API_KEY`: required for `POST /learning-path/generate`.
+- `GEMINI_API_KEY`: required for `POST /learning-path/generate` and `POST /course-recommendations/generate`.
 - `GEMINI_MODEL`: optional Gemini model name. Defaults to `gemini-1.5-flash`.
 
 ## Development
@@ -72,3 +72,37 @@ Errors:
 - `400`: invalid JSON or missing/invalid `candidateLessons` or `constraints.allowedLessonIds`.
 - `503`: `GEMINI_API_KEY` is not configured.
 - `502`: Gemini call fails, returns invalid JSON, or returns an invalid response shape.
+
+### `POST /course-recommendations/generate`
+
+Generates filtered course recommendations from candidate courses and constraints.
+
+Request body:
+
+```json
+{
+  "candidateCourses": [
+    {"courseId": 10, "title": "Present Simple Grammar"}
+  ],
+  "constraints": {
+    "allowedCourseIds": [10]
+  }
+}
+```
+
+Response body:
+
+```json
+{
+  "weaknesses": ["present simple"],
+  "recommendations": [
+    {"courseId": 10, "score": 0.94, "reason": "Grammar fit"}
+  ]
+}
+```
+
+Errors:
+
+- `400`: invalid JSON or missing/invalid `candidateCourses` or `constraints.allowedCourseIds`.
+- `503`: `GEMINI_API_KEY` is not configured.
+- `502`: Gemini call fails, returns invalid JSON, returns an invalid response shape, or returns no valid recommendations.
