@@ -820,3 +820,216 @@ def test_grammar_check_filters_mismatched_error_text_and_span(client, monkeypatc
             }
         ]
     }
+
+
+def _ai_tutor_payload(**overrides):
+    payload = {
+        "practiceType": "FREE_CHAT",
+        "title": "Free talk",
+        "latestMessage": "Hello",
+        "recentMessages": [],
+        "constraints": {"maxReplyLength": 4000, "maxFeedbackItems": 1, "feedbackStyle": "GENTLE"},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _mock_ai_tutor_model(monkeypatch, response_text, prompt_assertion=None):
+    class FakeResponse:
+        text = response_text
+
+    class FakeModel:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def generate_content(self, prompt):
+            if prompt_assertion is not None:
+                prompt_assertion(prompt)
+            return FakeResponse()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
+    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+
+
+def test_ai_tutor_rejects_missing_json(client):
+    response = client.post("/ai-tutor/respond", data="not-json")
+
+    assert response.status_code == 400
+    assert "JSON" in response.get_json()["error"]
+
+
+def test_ai_tutor_rejects_invalid_practice_type(client):
+    response = client.post("/ai-tutor/respond", json=_ai_tutor_payload(practiceType="BAD"))
+
+    assert response.status_code == 400
+    assert "practiceType" in response.get_json()["error"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_error"),
+    [
+        ("title", "   ", "title"),
+        ("title", "x" * 121, "title"),
+        ("latestMessage", "   ", "latestMessage"),
+        ("latestMessage", "x" * 2001, "latestMessage"),
+    ],
+)
+def test_ai_tutor_rejects_invalid_title_and_latest_message(client, field, value, expected_error):
+    response = client.post("/ai-tutor/respond", json=_ai_tutor_payload(**{field: value}))
+
+    assert response.status_code == 400
+    assert expected_error in response.get_json()["error"]
+
+
+def test_ai_tutor_requires_api_key(client, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    response = client.post("/ai-tutor/respond", json=_ai_tutor_payload())
+
+    assert response.status_code == 503
+    assert "GEMINI_API_KEY" in response.get_json()["error"]
+
+
+def test_ai_tutor_returns_reply_and_feedback(client, monkeypatch):
+    def assert_prompt(prompt):
+        assert "friendly native speaker" in prompt
+        assert "Return only valid JSON" in prompt
+        assert "ROLEPLAY means stay in the scenario from title" in prompt
+        assert "Do not include markdown, commentary, or extra keys" in prompt
+
+    _mock_ai_tutor_model(
+        monkeypatch,
+        json.dumps(
+            {
+                "replyText": " Sure, what kind of pizza would you like? ",
+                "feedback": {
+                    "errorType": "GRAMMAR",
+                    "originalText": " I want order pizza. ",
+                    "correctedText": " I want to order a pizza. ",
+                    "explanation": " Use want to before the verb. ",
+                },
+            }
+        ),
+        assert_prompt,
+    )
+
+    response = client.post(
+        "/ai-tutor/respond",
+        json=_ai_tutor_payload(
+            practiceType="ROLEPLAY",
+            title=" At the restaurant ",
+            latestMessage=" I want order pizza. ",
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "replyText": "Sure, what kind of pizza would you like?",
+        "feedback": {
+            "errorType": "GRAMMAR",
+            "originalText": "I want order pizza.",
+            "correctedText": "I want to order a pizza.",
+            "explanation": "Use want to before the verb.",
+        },
+    }
+
+
+def test_ai_tutor_accepts_null_feedback(client, monkeypatch):
+    _mock_ai_tutor_model(monkeypatch, json.dumps({"replyText": "That sounds great. Tell me more.", "feedback": None}))
+
+    response = client.post("/ai-tutor/respond", json=_ai_tutor_payload())
+
+    assert response.status_code == 200
+    assert response.get_json() == {"replyText": "That sounds great. Tell me more.", "feedback": None}
+
+
+def test_ai_tutor_accepts_fenced_json(client, monkeypatch):
+    _mock_ai_tutor_model(
+        monkeypatch,
+        """```json
+        {"replyText": "Nice answer. What happened next?", "feedback": null}
+        ```""",
+    )
+
+    response = client.post("/ai-tutor/respond", json=_ai_tutor_payload())
+
+    assert response.status_code == 200
+    assert response.get_json() == {"replyText": "Nice answer. What happened next?", "feedback": None}
+
+
+@pytest.mark.parametrize("response_text", ["not-json", json.dumps([{"replyText": "Hello"}]), json.dumps({"replyText": "   "})])
+def test_ai_tutor_returns_bad_gateway_for_invalid_or_malformed_response(client, monkeypatch, response_text):
+    _mock_ai_tutor_model(monkeypatch, response_text)
+
+    response = client.post("/ai-tutor/respond", json=_ai_tutor_payload())
+
+    assert response.status_code == 502
+    assert response.get_json()["error"] in {
+        "Gemini returned invalid response shape",
+        "Gemini returned invalid JSON: Expecting value",
+    }
+
+
+def test_ai_tutor_filters_invalid_feedback_to_null(client, monkeypatch):
+    _mock_ai_tutor_model(
+        monkeypatch,
+        json.dumps(
+            {
+                "replyText": "I understand. Try saying it one more time.",
+                "feedback": {
+                    "errorType": "BAD",
+                    "originalText": "I want order pizza.",
+                    "correctedText": "I want to order a pizza.",
+                    "explanation": "Use want to before the verb.",
+                },
+            }
+        ),
+    )
+
+    response = client.post("/ai-tutor/respond", json=_ai_tutor_payload())
+
+    assert response.status_code == 200
+    assert response.get_json() == {"replyText": "I understand. Try saying it one more time.", "feedback": None}
+
+
+def test_ai_tutor_accepts_recent_ai_message_longer_than_latest_message_limit(client, monkeypatch):
+    _mock_ai_tutor_model(monkeypatch, json.dumps({"replyText": "Thanks for the context. What would you like to say next?", "feedback": None}))
+
+    response = client.post(
+        "/ai-tutor/respond",
+        json=_ai_tutor_payload(recentMessages=[{"senderType": "AI", "message": "x" * 3000}]),
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {"replyText": "Thanks for the context. What would you like to say next?", "feedback": None}
+
+
+def test_ai_tutor_rejects_recent_message_longer_than_prompt_guard(client):
+    response = client.post(
+        "/ai-tutor/respond",
+        json=_ai_tutor_payload(recentMessages=[{"senderType": "AI", "message": "x" * 4001}]),
+    )
+
+    assert response.status_code == 400
+    assert "recentMessages" in response.get_json()["error"]
+
+
+def test_ai_tutor_rejects_too_many_recent_messages(client):
+    response = client.post(
+        "/ai-tutor/respond",
+        json=_ai_tutor_payload(recentMessages=[{"senderType": "USER", "message": "Hello"}] * 11),
+    )
+
+    assert response.status_code == 400
+    assert "recentMessages" in response.get_json()["error"]
+
+
+def test_ai_tutor_rejects_invalid_recent_message_shape(client):
+    response = client.post(
+        "/ai-tutor/respond",
+        json=_ai_tutor_payload(recentMessages=[{"senderType": "BOT", "message": "Hello"}]),
+    )
+
+    assert response.status_code == 400
+    assert "recentMessages" in response.get_json()["error"]
