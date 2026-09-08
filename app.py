@@ -11,6 +11,14 @@ GRAMMAR_ERROR_TYPES = {"GRAMMAR", "SPELLING", "PUNCTUATION", "WORD_CHOICE", "STY
 MAX_GRAMMAR_INPUT_LENGTH = 2000
 DEFAULT_MAX_GRAMMAR_ERRORS = 20
 MAX_GRAMMAR_ERROR_FIELD_LENGTH = 500
+AI_TUTOR_PRACTICE_TYPES = {"FREE_CHAT", "ROLEPLAY", "WRITING_PRACTICE"}
+AI_TUTOR_FEEDBACK_TYPES = {"GRAMMAR", "VOCABULARY", "WORD_CHOICE", "STYLE", "OTHER"}
+MAX_AI_TUTOR_TITLE_LENGTH = 120
+MAX_AI_TUTOR_MESSAGE_LENGTH = 2000
+MAX_AI_TUTOR_RECENT_MESSAGE_LENGTH = 4000
+MAX_AI_TUTOR_REPLY_LENGTH = 4000
+MAX_AI_TUTOR_FEEDBACK_LENGTH = 1000
+MAX_AI_TUTOR_RECENT_MESSAGES = 10
 
 
 def build_learning_path_prompt(payload):
@@ -79,6 +87,34 @@ Rules:
 - Return an empty errors array when the input is correct.
 - Return at most constraints.maxErrors errors.
 - Do not include markdown, commentary, correctedText, overallFeedback, or extra keys.
+
+Input:
+{json.dumps(payload, ensure_ascii=False)}
+"""
+
+
+def build_ai_tutor_prompt(payload):
+    return f"""You are a friendly native speaker helping an English learner practice.
+
+Return only valid JSON with this shape:
+{{
+  "replyText": "natural friendly reply that continues the conversation",
+  "feedback": {{
+    "errorType": "GRAMMAR",
+    "originalText": "student phrase with an issue",
+    "correctedText": "natural corrected phrase",
+    "explanation": "brief supportive explanation"
+  }}
+}}
+
+Rules:
+- Continue the conversation first; do not sound like a strict examiner.
+- feedback may be null when no correction is useful.
+- practiceType FREE_CHAT means natural conversation.
+- practiceType ROLEPLAY means stay in the scenario from title.
+- practiceType WRITING_PRACTICE means respond to the writing helpfully and gently.
+- feedback.errorType must be one of GRAMMAR, VOCABULARY, WORD_CHOICE, STYLE, OTHER.
+- Do not include markdown, commentary, or extra keys.
 
 Input:
 {json.dumps(payload, ensure_ascii=False)}
@@ -168,6 +204,44 @@ def _validate_grammar_payload(payload):
     max_errors = constraints.get("maxErrors", DEFAULT_MAX_GRAMMAR_ERRORS)
     if isinstance(max_errors, bool) or not isinstance(max_errors, int) or max_errors < 1 or max_errors > DEFAULT_MAX_GRAMMAR_ERRORS:
         return "constraints.maxErrors must be an integer from 1 to 20"
+
+    return None
+
+
+def _validate_ai_tutor_payload(payload):
+    if not isinstance(payload, dict):
+        return "Request body must be a JSON object"
+
+    if payload.get("practiceType") not in AI_TUTOR_PRACTICE_TYPES:
+        return "practiceType is invalid"
+
+    title = payload.get("title")
+    if not isinstance(title, str) or not title.strip() or len(title.strip()) > MAX_AI_TUTOR_TITLE_LENGTH:
+        return "title must be a non-empty string up to 120 characters"
+
+    latest_message = payload.get("latestMessage")
+    if (
+        not isinstance(latest_message, str)
+        or not latest_message.strip()
+        or len(latest_message.strip()) > MAX_AI_TUTOR_MESSAGE_LENGTH
+    ):
+        return "latestMessage must be a non-empty string up to 2000 characters"
+
+    recent_messages = payload.get("recentMessages")
+    if not isinstance(recent_messages, list) or len(recent_messages) > MAX_AI_TUTOR_RECENT_MESSAGES:
+        return "recentMessages must be an array with at most 10 items"
+
+    for item in recent_messages:
+        if not isinstance(item, dict):
+            return "recentMessages contains an invalid message"
+        message = item.get("message")
+        if (
+            item.get("senderType") not in {"USER", "AI"}
+            or not isinstance(message, str)
+            or not message.strip()
+            or len(message.strip()) > MAX_AI_TUTOR_RECENT_MESSAGE_LENGTH
+        ):
+            return "recentMessages contains an invalid message"
 
     return None
 
@@ -313,6 +387,44 @@ def _filter_grammar_errors(parsed, input_text, allowed_error_types, max_errors):
     return {"errors": filtered[:max_errors]}
 
 
+def _filter_ai_tutor_response(parsed):
+    if not isinstance(parsed, dict):
+        return None
+
+    reply_text = parsed.get("replyText")
+    if not isinstance(reply_text, str) or not reply_text.strip() or len(reply_text.strip()) > MAX_AI_TUTOR_REPLY_LENGTH:
+        return None
+
+    feedback = parsed.get("feedback")
+    normalized_feedback = None
+    if isinstance(feedback, dict):
+        error_type = feedback.get("errorType")
+        original_text = feedback.get("originalText")
+        corrected_text = feedback.get("correctedText")
+        explanation = feedback.get("explanation")
+        if (
+            isinstance(error_type, str)
+            and error_type in AI_TUTOR_FEEDBACK_TYPES
+            and isinstance(original_text, str)
+            and original_text.strip()
+            and len(original_text.strip()) <= MAX_AI_TUTOR_FEEDBACK_LENGTH
+            and isinstance(corrected_text, str)
+            and corrected_text.strip()
+            and len(corrected_text.strip()) <= MAX_AI_TUTOR_FEEDBACK_LENGTH
+            and isinstance(explanation, str)
+            and explanation.strip()
+            and len(explanation.strip()) <= MAX_AI_TUTOR_FEEDBACK_LENGTH
+        ):
+            normalized_feedback = {
+                "errorType": error_type,
+                "originalText": original_text.strip(),
+                "correctedText": corrected_text.strip(),
+                "explanation": explanation.strip(),
+            }
+
+    return {"replyText": reply_text.strip(), "feedback": normalized_feedback}
+
+
 def create_app():
     app = Flask(__name__)
 
@@ -439,6 +551,41 @@ def create_app():
             return jsonify({"error": "Gemini returned invalid response shape"}), 502
 
         return jsonify(grammar_result)
+
+    @app.post("/ai-tutor/respond")
+    def ai_tutor_respond():
+        payload = request.get_json(silent=True)
+        if payload is None:
+            return jsonify({"error": "Request body must be valid JSON"}), 400
+
+        validation_error = _validate_ai_tutor_payload(payload)
+        if validation_error:
+            return jsonify({"error": validation_error}), 400
+
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            return jsonify({"error": "GEMINI_API_KEY is required for generation"}), 503
+
+        prompt = build_ai_tutor_prompt(payload)
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+
+        try:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            parsed = parse_json_response(getattr(response, "text", ""))
+        except json.JSONDecodeError as exc:
+            return jsonify({"error": f"Gemini returned invalid JSON: {exc.msg}"}), 502
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 502
+        except Exception:
+            return jsonify({"error": "Gemini generation failed"}), 502
+
+        tutor_result = _filter_ai_tutor_response(parsed)
+        if tutor_result is None:
+            return jsonify({"error": "Gemini returned invalid response shape"}), 502
+
+        return jsonify(tutor_result)
 
     return app
 
