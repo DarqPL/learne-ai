@@ -321,3 +321,502 @@ def test_generate_returns_bad_gateway_when_gemini_json_is_not_object(client, mon
 
     assert response.status_code == 502
     assert response.get_json() == {"error": "Gemini returned invalid response shape"}
+
+
+def test_grammar_check_rejects_missing_json(client):
+    response = client.post("/grammar-checks/check", data="not-json")
+
+    assert response.status_code == 400
+    assert "JSON" in response.get_json()["error"]
+
+
+def test_grammar_check_rejects_blank_input(client):
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": "   ", "constraints": {"allowedErrorTypes": ["GRAMMAR"], "maxErrors": 20}},
+    )
+
+    assert response.status_code == 400
+    assert "inputText" in response.get_json()["error"]
+
+
+def test_grammar_check_requires_api_key(client, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": "I want order pizza.", "constraints": {"allowedErrorTypes": ["GRAMMAR"], "maxErrors": 20}},
+    )
+
+    assert response.status_code == 503
+    assert "GEMINI_API_KEY" in response.get_json()["error"]
+
+
+def test_grammar_check_rejects_invalid_constraints(client):
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": "I want order pizza.", "constraints": {"allowedErrorTypes": ["BAD_TYPE"], "maxErrors": 20}},
+    )
+
+    assert response.status_code == 400
+    assert "allowedErrorTypes" in response.get_json()["error"]
+
+
+def test_grammar_check_returns_valid_errors(client, monkeypatch):
+    class FakeResponse:
+        text = json.dumps(
+            {
+                "errors": [
+                    {
+                        "errorText": "want order",
+                        "errorType": "GRAMMAR",
+                        "suggestion": "want to order",
+                        "explanation": "After want, use to plus verb.",
+                        "startPos": 2,
+                        "endPos": 12,
+                    }
+                ]
+            }
+        )
+
+    class FakeModel:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def generate_content(self, prompt):
+            assert "Do not include markdown" in prompt
+            assert "correctedText" in prompt
+            assert "overallFeedback" in prompt
+            return FakeResponse()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
+    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+
+    response = client.post(
+        "/grammar-checks/check",
+        json={
+            "inputText": "I want order pizza.",
+            "constraints": {"allowedErrorTypes": ["GRAMMAR", "SPELLING"], "maxErrors": 20},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "errors": [
+            {
+                "errorText": "want order",
+                "errorType": "GRAMMAR",
+                "suggestion": "want to order",
+                "explanation": "After want, use to plus verb.",
+                "startPos": 2,
+                "endPos": 12,
+            }
+        ]
+    }
+
+
+def test_grammar_check_accepts_empty_errors(client, monkeypatch):
+    class FakeResponse:
+        text = json.dumps({"errors": []})
+
+    class FakeModel:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def generate_content(self, prompt):
+            return FakeResponse()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
+    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": "This sentence is correct.", "constraints": {"allowedErrorTypes": ["GRAMMAR"], "maxErrors": 20}},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {"errors": []}
+
+
+def test_grammar_check_accepts_fenced_json(client, monkeypatch):
+    class FakeResponse:
+        text = """```json
+        {"errors": []}
+        ```"""
+
+    class FakeModel:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def generate_content(self, prompt):
+            return FakeResponse()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
+    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": "This sentence is correct.", "constraints": {"allowedErrorTypes": ["GRAMMAR"], "maxErrors": 20}},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {"errors": []}
+
+
+def test_grammar_check_filters_invalid_items_sorts_and_limits(client, monkeypatch):
+    class FakeResponse:
+        text = json.dumps(
+            {
+                "errors": [
+                    {
+                        "errorText": "pizza yesterday",
+                        "errorType": "GRAMMAR",
+                        "suggestion": "pizza yesterday?",
+                        "explanation": "Question punctuation is missing.",
+                        "startPos": 13,
+                        "endPos": 28,
+                    },
+                    {"errorText": "bad", "errorType": "BAD_TYPE", "suggestion": "x", "explanation": "x", "startPos": 0, "endPos": 3},
+                    {"errorText": "bad", "errorType": "GRAMMAR", "suggestion": "x", "explanation": "x", "startPos": -1, "endPos": 3},
+                    {"errorText": "bad", "errorType": "GRAMMAR", "suggestion": "x", "explanation": "x", "startPos": 0, "endPos": 99},
+                    {"errorText": "bad", "errorType": "GRAMMAR", "suggestion": "x", "explanation": "x", "startPos": True, "endPos": 3},
+                    {"errorText": "want order", "errorType": "GRAMMAR", "suggestion": "want to order", "explanation": "Use to.", "startPos": 2, "endPos": 12},
+                ]
+            }
+        )
+
+    class FakeModel:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def generate_content(self, prompt):
+            return FakeResponse()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
+    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": "I want order pizza yesterday.", "constraints": {"allowedErrorTypes": ["GRAMMAR"], "maxErrors": 1}},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "errors": [
+            {
+                "errorText": "want order",
+                "errorType": "GRAMMAR",
+                "suggestion": "want to order",
+                "explanation": "Use to.",
+                "startPos": 2,
+                "endPos": 12,
+            }
+        ]
+    }
+
+
+def test_grammar_check_filters_oversized_explanation(client, monkeypatch):
+    class FakeResponse:
+        text = json.dumps(
+            {
+                "errors": [
+                    {
+                        "errorText": "want order",
+                        "errorType": "GRAMMAR",
+                        "suggestion": "want to order",
+                        "explanation": "x" * 501,
+                        "startPos": 2,
+                        "endPos": 12,
+                    }
+                ]
+            }
+        )
+
+    class FakeModel:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def generate_content(self, prompt):
+            return FakeResponse()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
+    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": "I want order pizza.", "constraints": {"allowedErrorTypes": ["GRAMMAR"], "maxErrors": 20}},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {"errors": []}
+
+
+def test_grammar_check_filters_oversized_error_text_and_suggestion(client, monkeypatch):
+    class FakeResponse:
+        text = json.dumps(
+            {
+                "errors": [
+                    {
+                        "errorText": "x" * 501,
+                        "errorType": "GRAMMAR",
+                        "suggestion": "y",
+                        "explanation": "Too long original span.",
+                        "startPos": 0,
+                        "endPos": 501,
+                    },
+                    {
+                        "errorText": "bad",
+                        "errorType": "GRAMMAR",
+                        "suggestion": "x" * 501,
+                        "explanation": "Too long suggestion.",
+                        "startPos": 502,
+                        "endPos": 505,
+                    },
+                ]
+            }
+        )
+
+    class FakeModel:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def generate_content(self, prompt):
+            return FakeResponse()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
+    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": f"{'x' * 501} bad", "constraints": {"allowedErrorTypes": ["GRAMMAR"], "maxErrors": 20}},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {"errors": []}
+
+
+def test_grammar_check_rejects_too_long_input(client):
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": "x" * 2001, "constraints": {"allowedErrorTypes": ["GRAMMAR"], "maxErrors": 20}},
+    )
+
+    assert response.status_code == 400
+    assert "inputText" in response.get_json()["error"]
+
+
+@pytest.mark.parametrize("errors", [None, {"errorText": "bad"}, "bad"])
+def test_grammar_check_returns_bad_gateway_for_missing_or_malformed_errors(client, monkeypatch, errors):
+    class FakeResponse:
+        text = json.dumps({} if errors is None else {"errors": errors})
+
+    class FakeModel:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def generate_content(self, prompt):
+            return FakeResponse()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
+    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": "I want order pizza.", "constraints": {"allowedErrorTypes": ["GRAMMAR"], "maxErrors": 20}},
+    )
+
+    assert response.status_code == 502
+    assert response.get_json() == {"error": "Gemini returned invalid response shape"}
+
+
+def test_grammar_check_returns_bad_gateway_when_gemini_generation_fails(client, monkeypatch):
+    class FakeModel:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def generate_content(self, prompt):
+            raise RuntimeError("provider secret detail")
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
+    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": "I want order pizza.", "constraints": {"allowedErrorTypes": ["GRAMMAR"], "maxErrors": 20}},
+    )
+
+    assert response.status_code == 502
+    assert response.get_json() == {"error": "Gemini generation failed"}
+
+
+def test_grammar_check_rejects_unhashable_allowed_error_type(client):
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": "I want order pizza.", "constraints": {"allowedErrorTypes": [{}], "maxErrors": 20}},
+    )
+
+    assert response.status_code == 400
+    assert "allowedErrorTypes" in response.get_json()["error"]
+
+
+def test_grammar_check_filters_unhashable_and_non_string_gemini_error_types(client, monkeypatch):
+    class FakeResponse:
+        text = json.dumps(
+            {
+                "errors": [
+                    {"errorText": "bad", "errorType": {}, "suggestion": "x", "explanation": "x", "startPos": 0, "endPos": 3},
+                    {"errorText": "bad", "errorType": 123, "suggestion": "x", "explanation": "x", "startPos": 0, "endPos": 3},
+                    {
+                        "errorText": "want order",
+                        "errorType": "GRAMMAR",
+                        "suggestion": "want to order",
+                        "explanation": "Use to.",
+                        "startPos": 2,
+                        "endPos": 12,
+                    },
+                ]
+            }
+        )
+
+    class FakeModel:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def generate_content(self, prompt):
+            return FakeResponse()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
+    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": "I want order pizza.", "constraints": {"allowedErrorTypes": ["GRAMMAR"], "maxErrors": 20}},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "errors": [
+            {
+                "errorText": "want order",
+                "errorType": "GRAMMAR",
+                "suggestion": "want to order",
+                "explanation": "Use to.",
+                "startPos": 2,
+                "endPos": 12,
+            }
+        ]
+    }
+
+
+def test_grammar_check_preserves_leading_space_offsets(client, monkeypatch):
+    class FakeResponse:
+        text = json.dumps(
+            {
+                "errors": [
+                    {
+                        "errorText": "want order",
+                        "errorType": "GRAMMAR",
+                        "suggestion": "want to order",
+                        "explanation": "Use to.",
+                        "startPos": 4,
+                        "endPos": 14,
+                    }
+                ]
+            }
+        )
+
+    class FakeModel:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def generate_content(self, prompt):
+            assert '"inputText": "  I want order pizza."' in prompt
+            return FakeResponse()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
+    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": "  I want order pizza.", "constraints": {"allowedErrorTypes": ["GRAMMAR"], "maxErrors": 20}},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "errors": [
+            {
+                "errorText": "want order",
+                "errorType": "GRAMMAR",
+                "suggestion": "want to order",
+                "explanation": "Use to.",
+                "startPos": 4,
+                "endPos": 14,
+            }
+        ]
+    }
+
+
+def test_grammar_check_filters_mismatched_error_text_and_span(client, monkeypatch):
+    class FakeResponse:
+        text = json.dumps(
+            {
+                "errors": [
+                    {
+                        "errorText": "want order",
+                        "errorType": "GRAMMAR",
+                        "suggestion": "want to order",
+                        "explanation": "Use to.",
+                        "startPos": 0,
+                        "endPos": 10,
+                    },
+                    {
+                        "errorText": "order",
+                        "errorType": "GRAMMAR",
+                        "suggestion": "to order",
+                        "explanation": "Use to.",
+                        "startPos": 7,
+                        "endPos": 12,
+                    },
+                ]
+            }
+        )
+
+    class FakeModel:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def generate_content(self, prompt):
+            return FakeResponse()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
+    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": "I want order pizza.", "constraints": {"allowedErrorTypes": ["GRAMMAR"], "maxErrors": 20}},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "errors": [
+            {
+                "errorText": "order",
+                "errorType": "GRAMMAR",
+                "suggestion": "to order",
+                "explanation": "Use to.",
+                "startPos": 7,
+                "endPos": 12,
+            }
+        ]
+    }
