@@ -3,6 +3,7 @@ import os
 import re
 
 from flask import Flask, jsonify, request
+import google.generativeai as genai
 import requests
 
 
