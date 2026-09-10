@@ -13,6 +13,10 @@ Flask service for AI-assisted learning path generation.
 - `LLM_COURSE_RECOMMENDATION_MODEL`: optional model override for `POST /course-recommendations/generate`.
 - `LLM_TIMEOUT_MS`: outbound timeout for AI Service calls to 9router. Defaults to `8000`.
 
+9router itself is configured from `infra/.env`:
+
+- `NINE_ROUTER_INITIAL_PASSWORD`: initial dashboard password for the 9router container. Change the example value before exposing the dashboard beyond localhost.
+
 ## Development
 
 ```bash
@@ -35,7 +39,9 @@ docker run --rm -e LLM_API_KEY=your-key learne-ai-dev
 
 ## 9router Development
 
-In the full Docker Compose environment, 9router runs as a separate container and publishes its dashboard/API on the host at `http://localhost:20128`.
+In the full Docker Compose environment, 9router runs as a separate container and publishes its dashboard/API on the host at `http://localhost:20128`. The Compose file binds this port to `127.0.0.1` so it is local-only by default.
+
+Set `NINE_ROUTER_INITIAL_PASSWORD` in `infra/.env` before first startup. The dashboard uses this initial password until you change it from the local dashboard.
 
 AI Service must not call `http://localhost:20128/v1` from inside Docker. Inside Docker, `localhost` points to the AI Service container itself. Use Docker service DNS instead:
 
@@ -43,7 +49,7 @@ AI Service must not call `http://localhost:20128/v1` from inside Docker. Inside 
 LLM_BASE_URL=http://9router:20128/v1
 ```
 
-Use the 9router dashboard to connect providers and copy the API key into `infra/.env` as `LLM_API_KEY`.
+Use the 9router dashboard to connect providers and copy the generated API key into `infra/.env` as `LLM_API_KEY`.
 
 In the full project, this service is intended to run inside Docker Compose and be called by backend through the internal URL `http://ai-service:5000`. It should not be exposed directly to frontend clients.
 
