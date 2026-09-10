@@ -128,7 +128,11 @@ def test_generate_llm_text_rejects_empty_response(monkeypatch):
 
     monkeypatch.setenv("LLM_API_KEY", "test-key")
     monkeypatch.setenv("LLM_DEFAULT_MODEL", "default-model")
-    monkeypatch.setattr("app.requests.post", lambda **kwargs: FakeResponse())
+
+    def fake_post(*args, **kwargs):
+        return FakeResponse()
+
+    monkeypatch.setattr("app.requests.post", fake_post)
 
     with pytest.raises(ValueError, match="LLM response was empty"):
         ai_app.generate_llm_text("Return JSON", "grammar")
