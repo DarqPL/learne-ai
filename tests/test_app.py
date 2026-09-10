@@ -182,6 +182,45 @@ def test_generate_llm_text_rejects_empty_response(monkeypatch):
         ai_app.generate_llm_text("Return JSON", "grammar")
 
 
+def test_generate_llm_text_extracts_sse_delta_content(monkeypatch):
+    class FakeResponse:
+        text = """data: {"choices":[{"delta":{"content":"{\\\"errors\\\":["},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"]}"},"finish_reason":null}]}
+
+data: [DONE]
+"""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            raise ValueError("not json")
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_GRAMMAR_MODEL", "grammar-model")
+    monkeypatch.setattr("app.requests.post", lambda *args, **kwargs: FakeResponse())
+
+    assert ai_app.generate_llm_text("Return JSON", "grammar") == '{"errors":[]}'
+
+
+def test_generate_llm_text_extracts_json_before_done_marker(monkeypatch):
+    class FakeResponse:
+        text = '{"choices":[{"message":{"content":"{\\"errors\\": []}"}}]}data: [DONE]'
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            raise ValueError("extra data")
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_GRAMMAR_MODEL", "grammar-model")
+    monkeypatch.setattr("app.requests.post", lambda *args, **kwargs: FakeResponse())
+
+    assert ai_app.generate_llm_text("Return JSON", "grammar") == '{"errors": []}'
+
+
 def test_generate_llm_text_uses_explicit_model(monkeypatch):
     captured = {}
 

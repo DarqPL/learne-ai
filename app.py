@@ -196,6 +196,45 @@ def _llm_chat_completions_url():
     return f"{base_url}/chat/completions"
 
 
+def _extract_llm_content(payload):
+    try:
+        choice = payload["choices"][0]
+        message = choice.get("message")
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            return message["content"]
+        delta = choice.get("delta")
+        if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+            return delta["content"]
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
+        raise LlmGenerationError("LLM returned invalid response shape") from exc
+
+    raise LlmGenerationError("LLM returned invalid response shape")
+
+
+def _parse_llm_response_text(text):
+    stripped = text.strip()
+    if not stripped:
+        raise ValueError("LLM response was empty")
+
+    if stripped.startswith("data:"):
+        chunks = []
+        for line in stripped.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line.removeprefix("data:").strip()
+            if not data or data == "[DONE]":
+                continue
+            chunks.append(_extract_llm_content(json.loads(data)))
+        return "".join(chunks)
+
+    done_marker_index = stripped.find("data: [DONE]")
+    if done_marker_index != -1:
+        stripped = stripped[:done_marker_index].strip()
+
+    return _extract_llm_content(json.loads(stripped))
+
+
 def generate_llm_text(prompt, task_name, model=None):
     api_key = os.environ.get("LLM_API_KEY", "").strip()
     if not api_key:
@@ -217,16 +256,14 @@ def generate_llm_text(prompt, task_name, model=None):
             timeout=_llm_timeout_seconds(),
         )
         response.raise_for_status()
-        payload = response.json()
+        try:
+            text = _extract_llm_content(response.json())
+        except ValueError:
+            text = _parse_llm_response_text(getattr(response, "text", ""))
     except requests.RequestException as exc:
         raise LlmGenerationError("LLM generation failed") from exc
     except ValueError as exc:
         raise LlmGenerationError("LLM generation failed") from exc
-
-    try:
-        text = payload["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise LlmGenerationError("LLM returned invalid response shape") from exc
 
     if not isinstance(text, str) or not text.strip():
         raise ValueError("LLM response was empty")
