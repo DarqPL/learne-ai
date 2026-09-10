@@ -3,7 +3,7 @@ import os
 import re
 
 from flask import Flask, jsonify, request
-import google.generativeai as genai
+import requests
 
 
 DEFAULT_RECOMMENDATION_REASON = "Recommended based on recent learning history."
@@ -19,6 +19,23 @@ MAX_AI_TUTOR_RECENT_MESSAGE_LENGTH = 4000
 MAX_AI_TUTOR_REPLY_LENGTH = 4000
 MAX_AI_TUTOR_FEEDBACK_LENGTH = 1000
 MAX_AI_TUTOR_RECENT_MESSAGES = 10
+LLM_TASK_MODEL_ENV = {
+    "grammar": "LLM_GRAMMAR_MODEL",
+    "ai_tutor": "LLM_AI_TUTOR_MODEL",
+    "learning_path": "LLM_LEARNING_PATH_MODEL",
+    "course_recommendation": "LLM_COURSE_RECOMMENDATION_MODEL",
+}
+DEFAULT_LLM_BASE_URL = "http://9router:20128/v1"
+DEFAULT_LLM_TIMEOUT_MS = 8000
+DEFAULT_LLM_TEMPERATURE = 0.2
+
+
+class LlmConfigurationError(RuntimeError):
+    pass
+
+
+class LlmGenerationError(RuntimeError):
+    pass
 
 
 def build_learning_path_prompt(payload):
@@ -121,9 +138,77 @@ Input:
 """
 
 
+def resolve_model(task_name):
+    task_model_env = LLM_TASK_MODEL_ENV.get(task_name)
+    if task_model_env:
+        task_model = os.environ.get(task_model_env, "").strip()
+        if task_model:
+            return task_model
+
+    default_model = os.environ.get("LLM_DEFAULT_MODEL", "").strip()
+    if default_model:
+        return default_model
+
+    return None
+
+
+def _llm_timeout_seconds():
+    raw_timeout = os.environ.get("LLM_TIMEOUT_MS", str(DEFAULT_LLM_TIMEOUT_MS)).strip()
+    try:
+        timeout_ms = int(raw_timeout)
+    except ValueError:
+        timeout_ms = DEFAULT_LLM_TIMEOUT_MS
+    if timeout_ms <= 0:
+        timeout_ms = DEFAULT_LLM_TIMEOUT_MS
+    return timeout_ms / 1000
+
+
+def _llm_chat_completions_url():
+    base_url = os.environ.get("LLM_BASE_URL", DEFAULT_LLM_BASE_URL).strip().rstrip("/")
+    return f"{base_url}/chat/completions"
+
+
+def generate_llm_text(prompt, task_name):
+    api_key = os.environ.get("LLM_API_KEY", "").strip()
+    if not api_key:
+        raise LlmConfigurationError("LLM_API_KEY is required for generation")
+
+    model = resolve_model(task_name)
+    if not model:
+        raise LlmConfigurationError("LLM model is required for generation")
+
+    try:
+        response = requests.post(
+            _llm_chat_completions_url(),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": DEFAULT_LLM_TEMPERATURE,
+            },
+            timeout=_llm_timeout_seconds(),
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise LlmGenerationError("LLM generation failed") from exc
+    except ValueError as exc:
+        raise LlmGenerationError("LLM generation failed") from exc
+
+    try:
+        text = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise LlmGenerationError("LLM returned invalid response shape") from exc
+
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("LLM response was empty")
+
+    return text
+
+
 def parse_json_response(text):
     if not isinstance(text, str) or not text.strip():
-        raise ValueError("Gemini response was empty")
+        raise ValueError("LLM response was empty")
 
     stripped = text.strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", stripped, re.DOTALL | re.IGNORECASE)
