@@ -44,6 +44,96 @@ def test_prompt_requires_numeric_lesson_id():
     assert "Do not return lessonId as a string" in prompt
 
 
+def test_resolve_model_uses_module_specific_model(monkeypatch):
+    monkeypatch.setenv("LLM_DEFAULT_MODEL", "default-model")
+    monkeypatch.setenv("LLM_GRAMMAR_MODEL", "grammar-model")
+
+    assert ai_app.resolve_model("grammar") == "grammar-model"
+
+
+def test_resolve_model_falls_back_to_default_model(monkeypatch):
+    monkeypatch.delenv("LLM_AI_TUTOR_MODEL", raising=False)
+    monkeypatch.setenv("LLM_DEFAULT_MODEL", "default-model")
+
+    assert ai_app.resolve_model("ai_tutor") == "default-model"
+
+
+def test_resolve_model_returns_none_when_no_task_or_default_model(monkeypatch):
+    monkeypatch.delenv("LLM_LEARNING_PATH_MODEL", raising=False)
+    monkeypatch.delenv("LLM_DEFAULT_MODEL", raising=False)
+
+    assert ai_app.resolve_model("learning_path") is None
+
+
+def test_generate_llm_text_posts_openai_compatible_payload(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "{\"ok\": true}"}}]}
+
+    def fake_post(url, headers, json, timeout):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setenv("LLM_BASE_URL", "http://9router:20128/v1")
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_GRAMMAR_MODEL", "grammar-model")
+    monkeypatch.setenv("LLM_TIMEOUT_MS", "1234")
+    monkeypatch.setattr("app.requests.post", fake_post)
+
+    result = ai_app.generate_llm_text("Return JSON", "grammar")
+
+    assert result == "{\"ok\": true}"
+    assert captured["url"] == "http://9router:20128/v1/chat/completions"
+    assert captured["headers"] == {"Authorization": "Bearer test-key", "Content-Type": "application/json"}
+    assert captured["json"] == {
+        "model": "grammar-model",
+        "messages": [{"role": "user", "content": "Return JSON"}],
+        "temperature": 0.2,
+    }
+    assert captured["timeout"] == 1.234
+
+
+def test_generate_llm_text_rejects_missing_api_key(monkeypatch):
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_DEFAULT_MODEL", "default-model")
+
+    with pytest.raises(ai_app.LlmConfigurationError, match="LLM_API_KEY"):
+        ai_app.generate_llm_text("Return JSON", "grammar")
+
+
+def test_generate_llm_text_rejects_missing_model(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.delenv("LLM_GRAMMAR_MODEL", raising=False)
+    monkeypatch.delenv("LLM_DEFAULT_MODEL", raising=False)
+
+    with pytest.raises(ai_app.LlmConfigurationError, match="LLM model"):
+        ai_app.generate_llm_text("Return JSON", "grammar")
+
+
+def test_generate_llm_text_rejects_empty_response(monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "   "}}]}
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_DEFAULT_MODEL", "default-model")
+    monkeypatch.setattr("app.requests.post", lambda **kwargs: FakeResponse())
+
+    with pytest.raises(ValueError, match="LLM response was empty"):
+        ai_app.generate_llm_text("Return JSON", "grammar")
+
+
 def test_course_recommendation_prompt_requires_numeric_course_id_and_multiple_courses():
     prompt = ai_app.build_course_recommendation_prompt({"constraints": {"allowedCourseIds": [10, 11]}})
 
