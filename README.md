@@ -4,8 +4,24 @@ Flask service for AI-assisted learning path generation.
 
 ## Environment
 
-- `GEMINI_API_KEY`: required for `POST /learning-path/generate` and `POST /course-recommendations/generate`.
-- `GEMINI_MODEL`: optional Gemini model name. Defaults to `gemini-1.5-flash`.
+- `LLM_BASE_URL`: 9router OpenAI-compatible API base URL. In Docker Compose this should be `http://9router:20128/v1`. When running AI Service directly on the host and 9router directly on the host, use `http://localhost:20128/v1`.
+- `LLM_API_KEY`: API key copied from the 9router dashboard. Required for real generation.
+- `LLM_DEFAULT_MODEL`: fallback model when a module-specific model is not configured. The development example is `kr/claude-sonnet-4.5` from the 9router quick-start docs.
+- `LLM_GRAMMAR_MODEL`: optional model override for `POST /grammar-checks/check`.
+- `LLM_GRAMMAR_FALLBACK_MODELS`: comma-separated fallback models for Grammar Check, tried in order.
+- `LLM_AI_TUTOR_MODEL`: optional model override for `POST /ai-tutor/respond`.
+- `LLM_AI_TUTOR_FALLBACK_MODELS`: comma-separated fallback models for AI Tutor, tried in order.
+- `LLM_LEARNING_PATH_MODEL`: optional model override for `POST /learning-path/generate`.
+- `LLM_LEARNING_PATH_FALLBACK_MODELS`: comma-separated fallback models for Learning Path, tried in order.
+- `LLM_COURSE_RECOMMENDATION_MODEL`: optional model override for `POST /course-recommendations/generate`.
+- `LLM_COURSE_RECOMMENDATION_FALLBACK_MODELS`: comma-separated fallback models for Course Recommendation, tried in order.
+- `LLM_TIMEOUT_MS`: outbound timeout for AI Service calls to 9router. Defaults to `8000` in code; Docker examples use `30000` for free models.
+
+Fallback model values are comma-separated. Empty entries are ignored, and duplicate models are skipped while preserving order.
+
+9router itself is configured from `infra/.env`:
+
+- `NINE_ROUTER_INITIAL_PASSWORD`: initial dashboard password for the 9router container. Change the example value before exposing the dashboard beyond localhost.
 
 ## Development
 
@@ -24,8 +40,22 @@ Build and run the development container:
 
 ```bash
 docker build -f Dockerfile.dev -t learne-ai-dev .
-docker run --rm -e GEMINI_API_KEY=your-key learne-ai-dev
+docker run --rm -e LLM_API_KEY=your-key learne-ai-dev
 ```
+
+## 9router Development
+
+In the full Docker Compose environment, 9router runs as a separate container and publishes its dashboard/API on the host at `http://localhost:20128`. The Compose file binds this port to `127.0.0.1` so it is local-only by default.
+
+Set `NINE_ROUTER_INITIAL_PASSWORD` in `infra/.env` before first startup. The dashboard uses this initial password until you change it from the local dashboard.
+
+AI Service must not call `http://localhost:20128/v1` from inside Docker. Inside Docker, `localhost` points to the AI Service container itself. Use Docker service DNS instead:
+
+```env
+LLM_BASE_URL=http://9router:20128/v1
+```
+
+Use the 9router dashboard to connect providers and copy the generated API key into `infra/.env` as `LLM_API_KEY`.
 
 In the full project, this service is intended to run inside Docker Compose and be called by backend through the internal URL `http://ai-service:5000`. It should not be exposed directly to frontend clients.
 
@@ -70,8 +100,8 @@ Response body:
 Errors:
 
 - `400`: invalid JSON or missing/invalid `candidateLessons` or `constraints.allowedLessonIds`.
-- `503`: `GEMINI_API_KEY` is not configured.
-- `502`: Gemini call fails, returns invalid JSON, or returns an invalid response shape.
+- `503`: `LLM_API_KEY` or an LLM model is not configured.
+- `502`: LLM call fails, returns invalid JSON, returns an invalid response shape, or returns no valid recommendations.
 
 ### `POST /course-recommendations/generate`
 
@@ -104,5 +134,5 @@ Response body:
 Errors:
 
 - `400`: invalid JSON or missing/invalid `candidateCourses` or `constraints.allowedCourseIds`.
-- `503`: `GEMINI_API_KEY` is not configured.
-- `502`: Gemini call fails, returns invalid JSON, returns an invalid response shape, or returns no valid recommendations.
+- `503`: `LLM_API_KEY` or an LLM model is not configured.
+- `502`: LLM call fails, returns invalid JSON, returns an invalid response shape, or returns no valid recommendations.

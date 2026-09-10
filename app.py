@@ -1,9 +1,10 @@
 import json
+import logging
 import os
 import re
 
 from flask import Flask, jsonify, request
-import google.generativeai as genai
+import requests
 
 
 DEFAULT_RECOMMENDATION_REASON = "Recommended based on recent learning history."
@@ -19,6 +20,30 @@ MAX_AI_TUTOR_RECENT_MESSAGE_LENGTH = 4000
 MAX_AI_TUTOR_REPLY_LENGTH = 4000
 MAX_AI_TUTOR_FEEDBACK_LENGTH = 1000
 MAX_AI_TUTOR_RECENT_MESSAGES = 10
+LLM_TASK_MODEL_ENV = {
+    "grammar": "LLM_GRAMMAR_MODEL",
+    "ai_tutor": "LLM_AI_TUTOR_MODEL",
+    "learning_path": "LLM_LEARNING_PATH_MODEL",
+    "course_recommendation": "LLM_COURSE_RECOMMENDATION_MODEL",
+}
+LLM_TASK_FALLBACK_ENV = {
+    "grammar": "LLM_GRAMMAR_FALLBACK_MODELS",
+    "ai_tutor": "LLM_AI_TUTOR_FALLBACK_MODELS",
+    "learning_path": "LLM_LEARNING_PATH_FALLBACK_MODELS",
+    "course_recommendation": "LLM_COURSE_RECOMMENDATION_FALLBACK_MODELS",
+}
+DEFAULT_LLM_BASE_URL = "http://9router:20128/v1"
+DEFAULT_LLM_TIMEOUT_MS = 8000
+DEFAULT_LLM_TEMPERATURE = 0.2
+logger = logging.getLogger(__name__)
+
+
+class LlmConfigurationError(RuntimeError):
+    pass
+
+
+class LlmGenerationError(RuntimeError):
+    pass
 
 
 def build_learning_path_prompt(payload):
@@ -121,9 +146,180 @@ Input:
 """
 
 
+def resolve_model(task_name):
+    task_model_env = LLM_TASK_MODEL_ENV.get(task_name)
+    if task_model_env:
+        task_model = os.environ.get(task_model_env, "").strip()
+        if task_model:
+            return task_model
+
+    default_model = os.environ.get("LLM_DEFAULT_MODEL", "").strip()
+    if default_model:
+        return default_model
+
+    return None
+
+
+def _append_unique_model(models, model):
+    normalized = model.strip()
+    if normalized and normalized not in models:
+        models.append(normalized)
+
+
+def resolve_models(task_name):
+    models = []
+    primary_model = resolve_model(task_name)
+    if primary_model:
+        _append_unique_model(models, primary_model)
+
+    fallback_env = LLM_TASK_FALLBACK_ENV.get(task_name)
+    if fallback_env:
+        for model in os.environ.get(fallback_env, "").split(","):
+            _append_unique_model(models, model)
+
+    return models
+
+
+def _llm_timeout_seconds():
+    raw_timeout = os.environ.get("LLM_TIMEOUT_MS", str(DEFAULT_LLM_TIMEOUT_MS)).strip()
+    try:
+        timeout_ms = int(raw_timeout)
+    except ValueError:
+        timeout_ms = DEFAULT_LLM_TIMEOUT_MS
+    if timeout_ms <= 0:
+        timeout_ms = DEFAULT_LLM_TIMEOUT_MS
+    return timeout_ms / 1000
+
+
+def _llm_chat_completions_url():
+    base_url = os.environ.get("LLM_BASE_URL", DEFAULT_LLM_BASE_URL).strip().rstrip("/")
+    return f"{base_url}/chat/completions"
+
+
+def _extract_llm_content(payload):
+    try:
+        choice = payload["choices"][0]
+        message = choice.get("message")
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            return message["content"]
+        delta = choice.get("delta")
+        if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+            return delta["content"]
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
+        raise LlmGenerationError("LLM returned invalid response shape") from exc
+
+    raise LlmGenerationError("LLM returned invalid response shape")
+
+
+def _parse_llm_response_text(text):
+    stripped = text.strip()
+    if not stripped:
+        raise ValueError("LLM response was empty")
+
+    if stripped.startswith("data:"):
+        chunks = []
+        for line in stripped.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line.removeprefix("data:").strip()
+            if not data or data == "[DONE]":
+                continue
+            chunks.append(_extract_llm_content(json.loads(data)))
+        return "".join(chunks)
+
+    done_marker_index = stripped.find("data: [DONE]")
+    if done_marker_index != -1:
+        stripped = stripped[:done_marker_index].strip()
+
+    return _extract_llm_content(json.loads(stripped))
+
+
+def generate_llm_text(prompt, task_name, model=None):
+    api_key = os.environ.get("LLM_API_KEY", "").strip()
+    if not api_key:
+        raise LlmConfigurationError("LLM_API_KEY is required for generation")
+
+    selected_model = model or resolve_model(task_name)
+    if not selected_model:
+        raise LlmConfigurationError("LLM model is required for generation")
+
+    try:
+        response = requests.post(
+            _llm_chat_completions_url(),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": selected_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": DEFAULT_LLM_TEMPERATURE,
+            },
+            timeout=_llm_timeout_seconds(),
+        )
+        response.raise_for_status()
+        try:
+            text = _extract_llm_content(response.json())
+        except ValueError:
+            text = _parse_llm_response_text(getattr(response, "text", ""))
+    except requests.RequestException as exc:
+        raise LlmGenerationError("LLM generation failed") from exc
+    except ValueError as exc:
+        raise LlmGenerationError("LLM generation failed") from exc
+
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("LLM response was empty")
+
+    return text
+
+
+def generate_llm_json(prompt, task_name):
+    models = resolve_models(task_name)
+    if not models:
+        raise LlmConfigurationError("LLM model is required for generation")
+
+    last_error = None
+    for model in models:
+        try:
+            text = generate_llm_text(prompt, task_name, model=model)
+            return parse_json_response(text)
+        except (json.JSONDecodeError, ValueError, LlmGenerationError) as exc:
+            last_error = exc
+            logger.warning("LLM model attempt failed task=%s model=%s error=%s", task_name, model, str(exc))
+
+    if isinstance(last_error, json.JSONDecodeError):
+        raise last_error
+    if isinstance(last_error, ValueError):
+        raise last_error
+    if isinstance(last_error, LlmGenerationError):
+        raise last_error
+    raise LlmGenerationError("LLM generation failed")
+
+
+def generate_valid_llm_result(prompt, task_name, validate_result):
+    models = resolve_models(task_name)
+    if not models:
+        raise LlmConfigurationError("LLM model is required for generation")
+
+    last_error = None
+    for model in models:
+        try:
+            parsed = parse_json_response(generate_llm_text(prompt, task_name, model=model))
+            return validate_result(parsed)
+        except (json.JSONDecodeError, ValueError, LlmGenerationError) as exc:
+            last_error = exc
+            logger.warning("LLM model attempt failed task=%s model=%s error=%s", task_name, model, str(exc))
+
+    if isinstance(last_error, json.JSONDecodeError):
+        raise last_error
+    if isinstance(last_error, ValueError):
+        raise last_error
+    if isinstance(last_error, LlmGenerationError):
+        raise last_error
+    raise LlmGenerationError("LLM generation failed")
+
+
 def parse_json_response(text):
     if not isinstance(text, str) or not text.strip():
-        raise ValueError("Gemini response was empty")
+        raise ValueError("LLM response was empty")
 
     stripped = text.strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", stripped, re.DOTALL | re.IGNORECASE)
@@ -442,31 +638,26 @@ def create_app():
         if validation_error:
             return jsonify({"error": validation_error}), 400
 
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            return jsonify({"error": "GEMINI_API_KEY is required for generation"}), 503
-
         prompt = build_learning_path_prompt(payload)
-        model_name = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+
+        def validate_learning_path(parsed):
+            if not isinstance(parsed, dict):
+                raise LlmGenerationError("LLM returned invalid response shape")
+            learning_path = _filter_learning_path(parsed, payload["constraints"]["allowedLessonIds"])
+            if not learning_path["recommendations"]:
+                raise LlmGenerationError("LLM returned no valid recommendations")
+            return learning_path
 
         try:
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            parsed = parse_json_response(getattr(response, "text", ""))
+            learning_path = generate_valid_llm_result(prompt, "learning_path", validate_learning_path)
         except json.JSONDecodeError as exc:
-            return jsonify({"error": f"Gemini returned invalid JSON: {exc.msg}"}), 502
+            return jsonify({"error": f"LLM returned invalid JSON: {exc.msg}"}), 502
+        except LlmConfigurationError as exc:
+            return jsonify({"error": str(exc)}), 503
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 502
-        except Exception as exc:
-            return jsonify({"error": "Gemini generation failed"}), 502
-
-        if not isinstance(parsed, dict):
-            return jsonify({"error": "Gemini returned invalid response shape"}), 502
-
-        learning_path = _filter_learning_path(parsed, payload["constraints"]["allowedLessonIds"])
-        if not learning_path["recommendations"]:
-            return jsonify({"error": "Gemini returned no valid recommendations"}), 502
+        except LlmGenerationError as exc:
+            return jsonify({"error": str(exc)}), 502
 
         return jsonify(learning_path)
 
@@ -480,31 +671,28 @@ def create_app():
         if validation_error:
             return jsonify({"error": validation_error}), 400
 
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            return jsonify({"error": "GEMINI_API_KEY is required for generation"}), 503
-
         prompt = build_course_recommendation_prompt(payload)
-        model_name = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+
+        def validate_course_recommendations(parsed):
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("recommendations"), list):
+                raise LlmGenerationError("LLM returned invalid response shape")
+            course_recommendations = _filter_course_recommendations(parsed, payload["constraints"]["allowedCourseIds"])
+            if not course_recommendations["recommendations"]:
+                raise LlmGenerationError("LLM returned no valid recommendations")
+            return course_recommendations
 
         try:
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            parsed = parse_json_response(getattr(response, "text", ""))
+            course_recommendations = generate_valid_llm_result(
+                prompt, "course_recommendation", validate_course_recommendations
+            )
         except json.JSONDecodeError as exc:
-            return jsonify({"error": f"Gemini returned invalid JSON: {exc.msg}"}), 502
+            return jsonify({"error": f"LLM returned invalid JSON: {exc.msg}"}), 502
+        except LlmConfigurationError as exc:
+            return jsonify({"error": str(exc)}), 503
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 502
-        except Exception as exc:
-            return jsonify({"error": "Gemini generation failed"}), 502
-
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("recommendations"), list):
-            return jsonify({"error": "Gemini returned invalid response shape"}), 502
-
-        course_recommendations = _filter_course_recommendations(parsed, payload["constraints"]["allowedCourseIds"])
-        if not course_recommendations["recommendations"]:
-            return jsonify({"error": "Gemini returned no valid recommendations"}), 502
+        except LlmGenerationError as exc:
+            return jsonify({"error": str(exc)}), 502
 
         return jsonify(course_recommendations)
 
@@ -518,37 +706,32 @@ def create_app():
         if validation_error:
             return jsonify({"error": validation_error}), 400
 
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            return jsonify({"error": "GEMINI_API_KEY is required for generation"}), 503
-
         input_text = payload["inputText"]
         prompt = build_grammar_check_prompt(payload)
-        model_name = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+
+        def validate_grammar(parsed):
+            if not isinstance(parsed, dict):
+                raise LlmGenerationError("LLM returned invalid response shape")
+            grammar_result = _filter_grammar_errors(
+                parsed,
+                input_text,
+                set(payload["constraints"]["allowedErrorTypes"]),
+                payload["constraints"].get("maxErrors", DEFAULT_MAX_GRAMMAR_ERRORS),
+            )
+            if grammar_result is None:
+                raise LlmGenerationError("LLM returned invalid response shape")
+            return grammar_result
 
         try:
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            parsed = parse_json_response(getattr(response, "text", ""))
+            grammar_result = generate_valid_llm_result(prompt, "grammar", validate_grammar)
         except json.JSONDecodeError as exc:
-            return jsonify({"error": f"Gemini returned invalid JSON: {exc.msg}"}), 502
+            return jsonify({"error": f"LLM returned invalid JSON: {exc.msg}"}), 502
+        except LlmConfigurationError as exc:
+            return jsonify({"error": str(exc)}), 503
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 502
-        except Exception:
-            return jsonify({"error": "Gemini generation failed"}), 502
-
-        if not isinstance(parsed, dict):
-            return jsonify({"error": "Gemini returned invalid response shape"}), 502
-
-        grammar_result = _filter_grammar_errors(
-            parsed,
-            input_text,
-            set(payload["constraints"]["allowedErrorTypes"]),
-            payload["constraints"].get("maxErrors", DEFAULT_MAX_GRAMMAR_ERRORS),
-        )
-        if grammar_result is None:
-            return jsonify({"error": "Gemini returned invalid response shape"}), 502
+        except LlmGenerationError as exc:
+            return jsonify({"error": str(exc)}), 502
 
         return jsonify(grammar_result)
 
@@ -562,28 +745,24 @@ def create_app():
         if validation_error:
             return jsonify({"error": validation_error}), 400
 
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            return jsonify({"error": "GEMINI_API_KEY is required for generation"}), 503
-
         prompt = build_ai_tutor_prompt(payload)
-        model_name = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+
+        def validate_tutor(parsed):
+            tutor_result = _filter_ai_tutor_response(parsed)
+            if tutor_result is None:
+                raise LlmGenerationError("LLM returned invalid response shape")
+            return tutor_result
 
         try:
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            parsed = parse_json_response(getattr(response, "text", ""))
+            tutor_result = generate_valid_llm_result(prompt, "ai_tutor", validate_tutor)
         except json.JSONDecodeError as exc:
-            return jsonify({"error": f"Gemini returned invalid JSON: {exc.msg}"}), 502
+            return jsonify({"error": f"LLM returned invalid JSON: {exc.msg}"}), 502
+        except LlmConfigurationError as exc:
+            return jsonify({"error": str(exc)}), 503
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 502
-        except Exception:
-            return jsonify({"error": "Gemini generation failed"}), 502
-
-        tutor_result = _filter_ai_tutor_response(parsed)
-        if tutor_result is None:
-            return jsonify({"error": "Gemini returned invalid response shape"}), 502
+        except LlmGenerationError as exc:
+            return jsonify({"error": str(exc)}), 502
 
         return jsonify(tutor_result)
 
