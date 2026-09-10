@@ -44,6 +44,17 @@ def test_prompt_requires_numeric_lesson_id():
     assert "Do not return lessonId as a string" in prompt
 
 
+def _mock_llm_text(monkeypatch, response_text, expected_task=None, prompt_assertion=None):
+    def fake_generate_llm_text(prompt, task_name):
+        if expected_task is not None:
+            assert task_name == expected_task
+        if prompt_assertion is not None:
+            prompt_assertion(prompt)
+        return response_text
+
+    monkeypatch.setattr("app.generate_llm_text", fake_generate_llm_text)
+
+
 def test_resolve_model_uses_module_specific_model(monkeypatch):
     monkeypatch.setenv("LLM_DEFAULT_MODEL", "default-model")
     monkeypatch.setenv("LLM_GRAMMAR_MODEL", "grammar-model")
@@ -198,32 +209,22 @@ def test_generate_rejects_missing_or_empty_required_arrays(client, payload, expe
 
 
 def test_generate_filters_invalid_and_duplicate_recommendations(client, monkeypatch):
-    class FakeResponse:
-        text = json.dumps(
-            {
-                "weaknesses": ["arrays"],
-                "recommendations": [
-                    {"lessonId": 12, "score": 0.8, "reason": "Practice arrays"},
-                    {"lessonId": "12", "score": 0.75, "reason": "Stringified numeric ID"},
-                    {"lessonId": "l2", "score": 0.7, "reason": "Not allowed"},
-                    {"lessonId": 12, "score": 0.6, "reason": "Duplicate"},
-                    {"lessonId": "l3", "score": 2, "reason": "Bad score"},
-                    {"lessonId": "l4", "score": 0.5},
-                    {"lessonId": "l5", "score": 0.4, "reason": "   "},
-                ],
-            }
-        )
+    response_text = json.dumps(
+        {
+            "weaknesses": ["arrays"],
+            "recommendations": [
+                {"lessonId": 12, "score": 0.8, "reason": "Practice arrays"},
+                {"lessonId": "12", "score": 0.75, "reason": "Stringified numeric ID"},
+                {"lessonId": "l2", "score": 0.7, "reason": "Not allowed"},
+                {"lessonId": 12, "score": 0.6, "reason": "Duplicate"},
+                {"lessonId": "l3", "score": 2, "reason": "Bad score"},
+                {"lessonId": "l4", "score": 0.5},
+                {"lessonId": "l5", "score": 0.4, "reason": "   "},
+            ],
+        }
+    )
 
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
-
-        def generate_content(self, prompt):
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    _mock_llm_text(monkeypatch, response_text, "learning_path")
 
     response = client.post(
         "/learning-path/generate",
@@ -261,30 +262,20 @@ def test_generate_filters_invalid_and_duplicate_recommendations(client, monkeypa
 
 
 def test_generate_course_recommendations_filters_invalid_and_duplicate_courses(client, monkeypatch):
-    class FakeResponse:
-        text = json.dumps(
-            {
-                "weaknesses": ["present simple"],
-                "recommendations": [
-                    {"courseId": 10, "score": 0.94, "reason": "Grammar fit"},
-                    {"courseId": "10", "score": 0.9, "reason": "Wrong type"},
-                    {"courseId": 10, "score": 0.8, "reason": "Duplicate"},
-                    {"courseId": 11, "score": 2, "reason": "Bad score"},
-                    {"courseId": 12, "score": 0.7, "reason": "Not allowed"},
-                ],
-            }
-        )
+    response_text = json.dumps(
+        {
+            "weaknesses": ["present simple"],
+            "recommendations": [
+                {"courseId": 10, "score": 0.94, "reason": "Grammar fit"},
+                {"courseId": "10", "score": 0.9, "reason": "Wrong type"},
+                {"courseId": 10, "score": 0.8, "reason": "Duplicate"},
+                {"courseId": 11, "score": 2, "reason": "Bad score"},
+                {"courseId": 12, "score": 0.7, "reason": "Not allowed"},
+            ],
+        }
+    )
 
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
-
-        def generate_content(self, prompt):
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    _mock_llm_text(monkeypatch, response_text, "course_recommendation")
 
     response = client.post(
         "/course-recommendations/generate",
@@ -305,19 +296,11 @@ def test_generate_course_recommendations_filters_invalid_and_duplicate_courses(c
 def test_generate_course_recommendations_returns_bad_gateway_for_malformed_recommendations(
     client, monkeypatch, recommendations
 ):
-    class FakeResponse:
-        text = json.dumps({"weaknesses": ["present simple"], "recommendations": recommendations})
-
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
-
-        def generate_content(self, prompt):
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    _mock_llm_text(
+        monkeypatch,
+        json.dumps({"weaknesses": ["present simple"], "recommendations": recommendations}),
+        "course_recommendation",
+    )
 
     response = client.post(
         "/course-recommendations/generate",
@@ -328,31 +311,21 @@ def test_generate_course_recommendations_returns_bad_gateway_for_malformed_recom
     )
 
     assert response.status_code == 502
-    assert response.get_json() == {"error": "Gemini returned invalid response shape"}
+    assert response.get_json() == {"error": "LLM returned invalid response shape"}
 
 
 def test_generate_returns_bad_gateway_when_filtering_removes_all_recommendations(client, monkeypatch):
-    class FakeResponse:
-        text = json.dumps(
-            {
-                "weaknesses": ["arrays"],
-                "recommendations": [
-                    {"lessonId": "l2", "score": 0.8, "reason": "Not allowed"},
-                    {"lessonId": "l1", "score": 2, "reason": "Bad score"},
-                ],
-            }
-        )
+    response_text = json.dumps(
+        {
+            "weaknesses": ["arrays"],
+            "recommendations": [
+                {"lessonId": "l2", "score": 0.8, "reason": "Not allowed"},
+                {"lessonId": "l1", "score": 2, "reason": "Bad score"},
+            ],
+        }
+    )
 
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
-
-        def generate_content(self, prompt):
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    _mock_llm_text(monkeypatch, response_text, "learning_path")
 
     response = client.post(
         "/learning-path/generate",
@@ -366,17 +339,11 @@ def test_generate_returns_bad_gateway_when_filtering_removes_all_recommendations
     assert "valid recommendations" in response.get_json()["error"]
 
 
-def test_generate_hides_raw_gemini_exception_details(client, monkeypatch):
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
+def test_generate_hides_raw_llm_exception_details(client, monkeypatch):
+    def fake_generate_llm_text(prompt, task_name):
+        raise ai_app.LlmGenerationError("LLM generation failed")
 
-        def generate_content(self, prompt):
-            raise RuntimeError("secret upstream token detail")
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    monkeypatch.setattr("app.generate_llm_text", fake_generate_llm_text)
 
     response = client.post(
         "/learning-path/generate",
@@ -387,23 +354,11 @@ def test_generate_hides_raw_gemini_exception_details(client, monkeypatch):
     )
 
     assert response.status_code == 502
-    assert response.get_json() == {"error": "Gemini generation failed"}
+    assert response.get_json() == {"error": "LLM generation failed"}
 
 
-def test_generate_returns_bad_gateway_when_gemini_json_is_not_object(client, monkeypatch):
-    class FakeResponse:
-        text = '[{"lessonId": "l1", "score": 0.8}]'
-
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
-
-        def generate_content(self, prompt):
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+def test_generate_returns_bad_gateway_when_llm_json_is_not_object(client, monkeypatch):
+    _mock_llm_text(monkeypatch, '[{"lessonId": "l1", "score": 0.8}]', "learning_path")
 
     response = client.post(
         "/learning-path/generate",
@@ -414,7 +369,7 @@ def test_generate_returns_bad_gateway_when_gemini_json_is_not_object(client, mon
     )
 
     assert response.status_code == 502
-    assert response.get_json() == {"error": "Gemini returned invalid response shape"}
+    assert response.get_json() == {"error": "LLM returned invalid response shape"}
 
 
 def test_grammar_check_rejects_missing_json(client):
@@ -435,7 +390,8 @@ def test_grammar_check_rejects_blank_input(client):
 
 
 def test_grammar_check_requires_api_key(client, monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_DEFAULT_MODEL", "default-model")
 
     response = client.post(
         "/grammar-checks/check",
@@ -443,7 +399,7 @@ def test_grammar_check_requires_api_key(client, monkeypatch):
     )
 
     assert response.status_code == 503
-    assert "GEMINI_API_KEY" in response.get_json()["error"]
+    assert "LLM_API_KEY" in response.get_json()["error"]
 
 
 def test_grammar_check_rejects_invalid_constraints(client):
@@ -457,35 +413,27 @@ def test_grammar_check_rejects_invalid_constraints(client):
 
 
 def test_grammar_check_returns_valid_errors(client, monkeypatch):
-    class FakeResponse:
-        text = json.dumps(
-            {
-                "errors": [
-                    {
-                        "errorText": "want order",
-                        "errorType": "GRAMMAR",
-                        "suggestion": "want to order",
-                        "explanation": "After want, use to plus verb.",
-                        "startPos": 2,
-                        "endPos": 12,
-                    }
-                ]
-            }
-        )
+    def assert_prompt(prompt):
+        assert "Do not include markdown" in prompt
+        assert "correctedText" in prompt
+        assert "overallFeedback" in prompt
 
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
+    response_text = json.dumps(
+        {
+            "errors": [
+                {
+                    "errorText": "want order",
+                    "errorType": "GRAMMAR",
+                    "suggestion": "want to order",
+                    "explanation": "After want, use to plus verb.",
+                    "startPos": 2,
+                    "endPos": 12,
+                }
+            ]
+        }
+    )
 
-        def generate_content(self, prompt):
-            assert "Do not include markdown" in prompt
-            assert "correctedText" in prompt
-            assert "overallFeedback" in prompt
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    _mock_llm_text(monkeypatch, response_text, "grammar", assert_prompt)
 
     response = client.post(
         "/grammar-checks/check",
@@ -511,19 +459,7 @@ def test_grammar_check_returns_valid_errors(client, monkeypatch):
 
 
 def test_grammar_check_accepts_empty_errors(client, monkeypatch):
-    class FakeResponse:
-        text = json.dumps({"errors": []})
-
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
-
-        def generate_content(self, prompt):
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    _mock_llm_text(monkeypatch, json.dumps({"errors": []}), "grammar")
 
     response = client.post(
         "/grammar-checks/check",
@@ -535,21 +471,13 @@ def test_grammar_check_accepts_empty_errors(client, monkeypatch):
 
 
 def test_grammar_check_accepts_fenced_json(client, monkeypatch):
-    class FakeResponse:
-        text = """```json
+    _mock_llm_text(
+        monkeypatch,
+        """```json
         {"errors": []}
-        ```"""
-
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
-
-        def generate_content(self, prompt):
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+        ```""",
+        "grammar",
+    )
 
     response = client.post(
         "/grammar-checks/check",
@@ -561,37 +489,27 @@ def test_grammar_check_accepts_fenced_json(client, monkeypatch):
 
 
 def test_grammar_check_filters_invalid_items_sorts_and_limits(client, monkeypatch):
-    class FakeResponse:
-        text = json.dumps(
-            {
-                "errors": [
-                    {
-                        "errorText": "pizza yesterday",
-                        "errorType": "GRAMMAR",
-                        "suggestion": "pizza yesterday?",
-                        "explanation": "Question punctuation is missing.",
-                        "startPos": 13,
-                        "endPos": 28,
-                    },
-                    {"errorText": "bad", "errorType": "BAD_TYPE", "suggestion": "x", "explanation": "x", "startPos": 0, "endPos": 3},
-                    {"errorText": "bad", "errorType": "GRAMMAR", "suggestion": "x", "explanation": "x", "startPos": -1, "endPos": 3},
-                    {"errorText": "bad", "errorType": "GRAMMAR", "suggestion": "x", "explanation": "x", "startPos": 0, "endPos": 99},
-                    {"errorText": "bad", "errorType": "GRAMMAR", "suggestion": "x", "explanation": "x", "startPos": True, "endPos": 3},
-                    {"errorText": "want order", "errorType": "GRAMMAR", "suggestion": "want to order", "explanation": "Use to.", "startPos": 2, "endPos": 12},
-                ]
-            }
-        )
+    response_text = json.dumps(
+        {
+            "errors": [
+                {
+                    "errorText": "pizza yesterday",
+                    "errorType": "GRAMMAR",
+                    "suggestion": "pizza yesterday?",
+                    "explanation": "Question punctuation is missing.",
+                    "startPos": 13,
+                    "endPos": 28,
+                },
+                {"errorText": "bad", "errorType": "BAD_TYPE", "suggestion": "x", "explanation": "x", "startPos": 0, "endPos": 3},
+                {"errorText": "bad", "errorType": "GRAMMAR", "suggestion": "x", "explanation": "x", "startPos": -1, "endPos": 3},
+                {"errorText": "bad", "errorType": "GRAMMAR", "suggestion": "x", "explanation": "x", "startPos": 0, "endPos": 99},
+                {"errorText": "bad", "errorType": "GRAMMAR", "suggestion": "x", "explanation": "x", "startPos": True, "endPos": 3},
+                {"errorText": "want order", "errorType": "GRAMMAR", "suggestion": "want to order", "explanation": "Use to.", "startPos": 2, "endPos": 12},
+            ]
+        }
+    )
 
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
-
-        def generate_content(self, prompt):
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    _mock_llm_text(monkeypatch, response_text, "grammar")
 
     response = client.post(
         "/grammar-checks/check",
@@ -614,32 +532,22 @@ def test_grammar_check_filters_invalid_items_sorts_and_limits(client, monkeypatc
 
 
 def test_grammar_check_filters_oversized_explanation(client, monkeypatch):
-    class FakeResponse:
-        text = json.dumps(
-            {
-                "errors": [
-                    {
-                        "errorText": "want order",
-                        "errorType": "GRAMMAR",
-                        "suggestion": "want to order",
-                        "explanation": "x" * 501,
-                        "startPos": 2,
-                        "endPos": 12,
-                    }
-                ]
-            }
-        )
+    response_text = json.dumps(
+        {
+            "errors": [
+                {
+                    "errorText": "want order",
+                    "errorType": "GRAMMAR",
+                    "suggestion": "want to order",
+                    "explanation": "x" * 501,
+                    "startPos": 2,
+                    "endPos": 12,
+                }
+            ]
+        }
+    )
 
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
-
-        def generate_content(self, prompt):
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    _mock_llm_text(monkeypatch, response_text, "grammar")
 
     response = client.post(
         "/grammar-checks/check",
@@ -651,40 +559,30 @@ def test_grammar_check_filters_oversized_explanation(client, monkeypatch):
 
 
 def test_grammar_check_filters_oversized_error_text_and_suggestion(client, monkeypatch):
-    class FakeResponse:
-        text = json.dumps(
-            {
-                "errors": [
-                    {
-                        "errorText": "x" * 501,
-                        "errorType": "GRAMMAR",
-                        "suggestion": "y",
-                        "explanation": "Too long original span.",
-                        "startPos": 0,
-                        "endPos": 501,
-                    },
-                    {
-                        "errorText": "bad",
-                        "errorType": "GRAMMAR",
-                        "suggestion": "x" * 501,
-                        "explanation": "Too long suggestion.",
-                        "startPos": 502,
-                        "endPos": 505,
-                    },
-                ]
-            }
-        )
+    response_text = json.dumps(
+        {
+            "errors": [
+                {
+                    "errorText": "x" * 501,
+                    "errorType": "GRAMMAR",
+                    "suggestion": "y",
+                    "explanation": "Too long original span.",
+                    "startPos": 0,
+                    "endPos": 501,
+                },
+                {
+                    "errorText": "bad",
+                    "errorType": "GRAMMAR",
+                    "suggestion": "x" * 501,
+                    "explanation": "Too long suggestion.",
+                    "startPos": 502,
+                    "endPos": 505,
+                },
+            ]
+        }
+    )
 
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
-
-        def generate_content(self, prompt):
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    _mock_llm_text(monkeypatch, response_text, "grammar")
 
     response = client.post(
         "/grammar-checks/check",
@@ -707,19 +605,7 @@ def test_grammar_check_rejects_too_long_input(client):
 
 @pytest.mark.parametrize("errors", [None, {"errorText": "bad"}, "bad"])
 def test_grammar_check_returns_bad_gateway_for_missing_or_malformed_errors(client, monkeypatch, errors):
-    class FakeResponse:
-        text = json.dumps({} if errors is None else {"errors": errors})
-
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
-
-        def generate_content(self, prompt):
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    _mock_llm_text(monkeypatch, json.dumps({} if errors is None else {"errors": errors}), "grammar")
 
     response = client.post(
         "/grammar-checks/check",
@@ -727,20 +613,14 @@ def test_grammar_check_returns_bad_gateway_for_missing_or_malformed_errors(clien
     )
 
     assert response.status_code == 502
-    assert response.get_json() == {"error": "Gemini returned invalid response shape"}
+    assert response.get_json() == {"error": "LLM returned invalid response shape"}
 
 
-def test_grammar_check_returns_bad_gateway_when_gemini_generation_fails(client, monkeypatch):
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
+def test_grammar_check_returns_bad_gateway_when_llm_generation_fails(client, monkeypatch):
+    def fake_generate_llm_text(prompt, task_name):
+        raise ai_app.LlmGenerationError("LLM generation failed")
 
-        def generate_content(self, prompt):
-            raise RuntimeError("provider secret detail")
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    monkeypatch.setattr("app.generate_llm_text", fake_generate_llm_text)
 
     response = client.post(
         "/grammar-checks/check",
@@ -748,7 +628,7 @@ def test_grammar_check_returns_bad_gateway_when_gemini_generation_fails(client, 
     )
 
     assert response.status_code == 502
-    assert response.get_json() == {"error": "Gemini generation failed"}
+    assert response.get_json() == {"error": "LLM generation failed"}
 
 
 def test_grammar_check_rejects_unhashable_allowed_error_type(client):
@@ -761,35 +641,25 @@ def test_grammar_check_rejects_unhashable_allowed_error_type(client):
     assert "allowedErrorTypes" in response.get_json()["error"]
 
 
-def test_grammar_check_filters_unhashable_and_non_string_gemini_error_types(client, monkeypatch):
-    class FakeResponse:
-        text = json.dumps(
-            {
-                "errors": [
-                    {"errorText": "bad", "errorType": {}, "suggestion": "x", "explanation": "x", "startPos": 0, "endPos": 3},
-                    {"errorText": "bad", "errorType": 123, "suggestion": "x", "explanation": "x", "startPos": 0, "endPos": 3},
-                    {
-                        "errorText": "want order",
-                        "errorType": "GRAMMAR",
-                        "suggestion": "want to order",
-                        "explanation": "Use to.",
-                        "startPos": 2,
-                        "endPos": 12,
-                    },
-                ]
-            }
-        )
+def test_grammar_check_filters_unhashable_and_non_string_llm_error_types(client, monkeypatch):
+    response_text = json.dumps(
+        {
+            "errors": [
+                {"errorText": "bad", "errorType": {}, "suggestion": "x", "explanation": "x", "startPos": 0, "endPos": 3},
+                {"errorText": "bad", "errorType": 123, "suggestion": "x", "explanation": "x", "startPos": 0, "endPos": 3},
+                {
+                    "errorText": "want order",
+                    "errorType": "GRAMMAR",
+                    "suggestion": "want to order",
+                    "explanation": "Use to.",
+                    "startPos": 2,
+                    "endPos": 12,
+                },
+            ]
+        }
+    )
 
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
-
-        def generate_content(self, prompt):
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    _mock_llm_text(monkeypatch, response_text, "grammar")
 
     response = client.post(
         "/grammar-checks/check",
@@ -812,33 +682,25 @@ def test_grammar_check_filters_unhashable_and_non_string_gemini_error_types(clie
 
 
 def test_grammar_check_preserves_leading_space_offsets(client, monkeypatch):
-    class FakeResponse:
-        text = json.dumps(
-            {
-                "errors": [
-                    {
-                        "errorText": "want order",
-                        "errorType": "GRAMMAR",
-                        "suggestion": "want to order",
-                        "explanation": "Use to.",
-                        "startPos": 4,
-                        "endPos": 14,
-                    }
-                ]
-            }
-        )
+    def assert_prompt(prompt):
+        assert '"inputText": "  I want order pizza."' in prompt
 
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
+    response_text = json.dumps(
+        {
+            "errors": [
+                {
+                    "errorText": "want order",
+                    "errorType": "GRAMMAR",
+                    "suggestion": "want to order",
+                    "explanation": "Use to.",
+                    "startPos": 4,
+                    "endPos": 14,
+                }
+            ]
+        }
+    )
 
-        def generate_content(self, prompt):
-            assert '"inputText": "  I want order pizza."' in prompt
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    _mock_llm_text(monkeypatch, response_text, "grammar", assert_prompt)
 
     response = client.post(
         "/grammar-checks/check",
@@ -861,40 +723,30 @@ def test_grammar_check_preserves_leading_space_offsets(client, monkeypatch):
 
 
 def test_grammar_check_filters_mismatched_error_text_and_span(client, monkeypatch):
-    class FakeResponse:
-        text = json.dumps(
-            {
-                "errors": [
-                    {
-                        "errorText": "want order",
-                        "errorType": "GRAMMAR",
-                        "suggestion": "want to order",
-                        "explanation": "Use to.",
-                        "startPos": 0,
-                        "endPos": 10,
-                    },
-                    {
-                        "errorText": "order",
-                        "errorType": "GRAMMAR",
-                        "suggestion": "to order",
-                        "explanation": "Use to.",
-                        "startPos": 7,
-                        "endPos": 12,
-                    },
-                ]
-            }
-        )
+    response_text = json.dumps(
+        {
+            "errors": [
+                {
+                    "errorText": "want order",
+                    "errorType": "GRAMMAR",
+                    "suggestion": "want to order",
+                    "explanation": "Use to.",
+                    "startPos": 0,
+                    "endPos": 10,
+                },
+                {
+                    "errorText": "order",
+                    "errorType": "GRAMMAR",
+                    "suggestion": "to order",
+                    "explanation": "Use to.",
+                    "startPos": 7,
+                    "endPos": 12,
+                },
+            ]
+        }
+    )
 
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
-
-        def generate_content(self, prompt):
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    _mock_llm_text(monkeypatch, response_text, "grammar")
 
     response = client.post(
         "/grammar-checks/check",
@@ -929,21 +781,7 @@ def _ai_tutor_payload(**overrides):
 
 
 def _mock_ai_tutor_model(monkeypatch, response_text, prompt_assertion=None):
-    class FakeResponse:
-        text = response_text
-
-    class FakeModel:
-        def __init__(self, model_name):
-            self.model_name = model_name
-
-        def generate_content(self, prompt):
-            if prompt_assertion is not None:
-                prompt_assertion(prompt)
-            return FakeResponse()
-
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr("app.genai.configure", lambda api_key: None)
-    monkeypatch.setattr("app.genai.GenerativeModel", FakeModel)
+    _mock_llm_text(monkeypatch, response_text, "ai_tutor", prompt_assertion)
 
 
 def test_ai_tutor_rejects_missing_json(client):
@@ -977,12 +815,13 @@ def test_ai_tutor_rejects_invalid_title_and_latest_message(client, field, value,
 
 
 def test_ai_tutor_requires_api_key(client, monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_DEFAULT_MODEL", "default-model")
 
     response = client.post("/ai-tutor/respond", json=_ai_tutor_payload())
 
     assert response.status_code == 503
-    assert "GEMINI_API_KEY" in response.get_json()["error"]
+    assert "LLM_API_KEY" in response.get_json()["error"]
 
 
 def test_ai_tutor_returns_reply_and_feedback(client, monkeypatch):
@@ -1060,8 +899,8 @@ def test_ai_tutor_returns_bad_gateway_for_invalid_or_malformed_response(client, 
 
     assert response.status_code == 502
     assert response.get_json()["error"] in {
-        "Gemini returned invalid response shape",
-        "Gemini returned invalid JSON: Expecting value",
+        "LLM returned invalid response shape",
+        "LLM returned invalid JSON: Expecting value",
     }
 
 
