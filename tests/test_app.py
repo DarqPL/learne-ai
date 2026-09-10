@@ -45,7 +45,9 @@ def test_prompt_requires_numeric_lesson_id():
 
 
 def _mock_llm_text(monkeypatch, response_text, expected_task=None, prompt_assertion=None):
-    def fake_generate_llm_text(prompt, task_name):
+    monkeypatch.setenv("LLM_DEFAULT_MODEL", "test-model")
+
+    def fake_generate_llm_text(prompt, task_name, model=None):
         if expected_task is not None:
             assert task_name == expected_task
         if prompt_assertion is not None:
@@ -74,6 +76,37 @@ def test_resolve_model_returns_none_when_no_task_or_default_model(monkeypatch):
     monkeypatch.delenv("LLM_DEFAULT_MODEL", raising=False)
 
     assert ai_app.resolve_model("learning_path") is None
+
+
+def test_resolve_models_includes_primary_and_fallbacks_without_duplicates(monkeypatch):
+    monkeypatch.setenv("LLM_GRAMMAR_MODEL", "oc/ling-3.0-flash-fin-free")
+    monkeypatch.setenv("LLM_DEFAULT_MODEL", "oc/default")
+    monkeypatch.setenv(
+        "LLM_GRAMMAR_FALLBACK_MODELS",
+        " oc/mimo-v2.5-free, oc/ling-3.0-flash-fin-free,, oc/muse-spark-1.3-contributor-free ",
+    )
+
+    assert ai_app.resolve_models("grammar") == [
+        "oc/ling-3.0-flash-fin-free",
+        "oc/mimo-v2.5-free",
+        "oc/muse-spark-1.3-contributor-free",
+    ]
+
+
+def test_resolve_models_uses_default_before_fallbacks_when_primary_missing(monkeypatch):
+    monkeypatch.delenv("LLM_AI_TUTOR_MODEL", raising=False)
+    monkeypatch.setenv("LLM_DEFAULT_MODEL", "oc/default")
+    monkeypatch.setenv("LLM_AI_TUTOR_FALLBACK_MODELS", "oc/mimo-v2.5-free")
+
+    assert ai_app.resolve_models("ai_tutor") == ["oc/default", "oc/mimo-v2.5-free"]
+
+
+def test_resolve_models_returns_empty_when_no_primary_default_or_fallback(monkeypatch):
+    monkeypatch.delenv("LLM_LEARNING_PATH_MODEL", raising=False)
+    monkeypatch.delenv("LLM_DEFAULT_MODEL", raising=False)
+    monkeypatch.delenv("LLM_LEARNING_PATH_FALLBACK_MODELS", raising=False)
+
+    assert ai_app.resolve_models("learning_path") == []
 
 
 def test_generate_llm_text_posts_openai_compatible_payload(monkeypatch):
@@ -147,6 +180,60 @@ def test_generate_llm_text_rejects_empty_response(monkeypatch):
 
     with pytest.raises(ValueError, match="LLM response was empty"):
         ai_app.generate_llm_text("Return JSON", "grammar")
+
+
+def test_generate_llm_text_uses_explicit_model(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "{\"ok\": true}"}}]}
+
+    def fake_post(url, headers, json, timeout):
+        captured["model"] = json["model"]
+        return FakeResponse()
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_GRAMMAR_MODEL", "primary-model")
+    monkeypatch.setattr("app.requests.post", fake_post)
+
+    assert ai_app.generate_llm_text("Return JSON", "grammar", model="fallback-model") == "{\"ok\": true}"
+    assert captured["model"] == "fallback-model"
+
+
+def test_generate_llm_json_tries_fallback_after_generation_error(monkeypatch):
+    attempts = []
+
+    def fake_generate_llm_text(prompt, task_name, model=None):
+        attempts.append(model)
+        if model == "primary-model":
+            raise ai_app.LlmGenerationError("LLM generation failed")
+        return "{\"errors\": []}"
+
+    monkeypatch.setenv("LLM_GRAMMAR_MODEL", "primary-model")
+    monkeypatch.setenv("LLM_GRAMMAR_FALLBACK_MODELS", "fallback-model")
+    monkeypatch.setattr("app.generate_llm_text", fake_generate_llm_text)
+
+    assert ai_app.generate_llm_json("Return JSON", "grammar") == {"errors": []}
+    assert attempts == ["primary-model", "fallback-model"]
+
+
+def test_generate_llm_json_tries_fallback_after_invalid_json(monkeypatch):
+    attempts = []
+
+    def fake_generate_llm_text(prompt, task_name, model=None):
+        attempts.append(model)
+        return "not-json" if model == "primary-model" else "{\"errors\": []}"
+
+    monkeypatch.setenv("LLM_GRAMMAR_MODEL", "primary-model")
+    monkeypatch.setenv("LLM_GRAMMAR_FALLBACK_MODELS", "fallback-model")
+    monkeypatch.setattr("app.generate_llm_text", fake_generate_llm_text)
+
+    assert ai_app.generate_llm_json("Return JSON", "grammar") == {"errors": []}
+    assert attempts == ["primary-model", "fallback-model"]
 
 
 def test_course_recommendation_prompt_requires_numeric_course_id_and_multiple_courses():
@@ -261,6 +348,33 @@ def test_generate_filters_invalid_and_duplicate_recommendations(client, monkeypa
     }
 
 
+def test_learning_path_falls_back_when_primary_has_no_valid_recommendations(client, monkeypatch):
+    responses = iter(
+        [
+            json.dumps({"weaknesses": ["tense"], "recommendations": [{"lessonId": 999, "score": 0.9, "reason": "bad"}]}),
+            json.dumps({"weaknesses": ["tense"], "recommendations": [{"lessonId": 12, "score": 0.8, "reason": "Practice tense"}]}),
+        ]
+    )
+    attempts = []
+
+    def fake_generate_llm_text(prompt, task_name, model=None):
+        attempts.append(model)
+        return next(responses)
+
+    monkeypatch.setenv("LLM_LEARNING_PATH_MODEL", "primary-model")
+    monkeypatch.setenv("LLM_LEARNING_PATH_FALLBACK_MODELS", "fallback-model")
+    monkeypatch.setattr("app.generate_llm_text", fake_generate_llm_text)
+
+    response = client.post(
+        "/learning-path/generate",
+        json={"candidateLessons": [{"lessonId": 12}], "constraints": {"allowedLessonIds": [12]}},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["recommendations"][0]["lessonId"] == 12
+    assert attempts == ["primary-model", "fallback-model"]
+
+
 def test_generate_course_recommendations_filters_invalid_and_duplicate_courses(client, monkeypatch):
     response_text = json.dumps(
         {
@@ -340,7 +454,9 @@ def test_generate_returns_bad_gateway_when_filtering_removes_all_recommendations
 
 
 def test_generate_hides_raw_llm_exception_details(client, monkeypatch):
-    def fake_generate_llm_text(prompt, task_name):
+    monkeypatch.setenv("LLM_DEFAULT_MODEL", "test-model")
+
+    def fake_generate_llm_text(prompt, task_name, model=None):
         raise ai_app.LlmGenerationError("LLM generation failed")
 
     monkeypatch.setattr("app.generate_llm_text", fake_generate_llm_text)
@@ -468,6 +584,27 @@ def test_grammar_check_accepts_empty_errors(client, monkeypatch):
 
     assert response.status_code == 200
     assert response.get_json() == {"errors": []}
+
+
+def test_grammar_empty_errors_does_not_fallback(client, monkeypatch):
+    attempts = []
+
+    def fake_generate_llm_text(prompt, task_name, model=None):
+        attempts.append(model)
+        return json.dumps({"errors": []})
+
+    monkeypatch.setenv("LLM_GRAMMAR_MODEL", "primary-model")
+    monkeypatch.setenv("LLM_GRAMMAR_FALLBACK_MODELS", "fallback-model")
+    monkeypatch.setattr("app.generate_llm_text", fake_generate_llm_text)
+
+    response = client.post(
+        "/grammar-checks/check",
+        json={"inputText": "This is correct.", "constraints": {"allowedErrorTypes": ["GRAMMAR"], "maxErrors": 20}},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {"errors": []}
+    assert attempts == ["primary-model"]
 
 
 def test_grammar_check_accepts_fenced_json(client, monkeypatch):
@@ -617,7 +754,9 @@ def test_grammar_check_returns_bad_gateway_for_missing_or_malformed_errors(clien
 
 
 def test_grammar_check_returns_bad_gateway_when_llm_generation_fails(client, monkeypatch):
-    def fake_generate_llm_text(prompt, task_name):
+    monkeypatch.setenv("LLM_DEFAULT_MODEL", "test-model")
+
+    def fake_generate_llm_text(prompt, task_name, model=None):
         raise ai_app.LlmGenerationError("LLM generation failed")
 
     monkeypatch.setattr("app.generate_llm_text", fake_generate_llm_text)

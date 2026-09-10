@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 
@@ -25,9 +26,16 @@ LLM_TASK_MODEL_ENV = {
     "learning_path": "LLM_LEARNING_PATH_MODEL",
     "course_recommendation": "LLM_COURSE_RECOMMENDATION_MODEL",
 }
+LLM_TASK_FALLBACK_ENV = {
+    "grammar": "LLM_GRAMMAR_FALLBACK_MODELS",
+    "ai_tutor": "LLM_AI_TUTOR_FALLBACK_MODELS",
+    "learning_path": "LLM_LEARNING_PATH_FALLBACK_MODELS",
+    "course_recommendation": "LLM_COURSE_RECOMMENDATION_FALLBACK_MODELS",
+}
 DEFAULT_LLM_BASE_URL = "http://9router:20128/v1"
 DEFAULT_LLM_TIMEOUT_MS = 8000
 DEFAULT_LLM_TEMPERATURE = 0.2
+logger = logging.getLogger(__name__)
 
 
 class LlmConfigurationError(RuntimeError):
@@ -152,6 +160,26 @@ def resolve_model(task_name):
     return None
 
 
+def _append_unique_model(models, model):
+    normalized = model.strip()
+    if normalized and normalized not in models:
+        models.append(normalized)
+
+
+def resolve_models(task_name):
+    models = []
+    primary_model = resolve_model(task_name)
+    if primary_model:
+        _append_unique_model(models, primary_model)
+
+    fallback_env = LLM_TASK_FALLBACK_ENV.get(task_name)
+    if fallback_env:
+        for model in os.environ.get(fallback_env, "").split(","):
+            _append_unique_model(models, model)
+
+    return models
+
+
 def _llm_timeout_seconds():
     raw_timeout = os.environ.get("LLM_TIMEOUT_MS", str(DEFAULT_LLM_TIMEOUT_MS)).strip()
     try:
@@ -168,13 +196,13 @@ def _llm_chat_completions_url():
     return f"{base_url}/chat/completions"
 
 
-def generate_llm_text(prompt, task_name):
+def generate_llm_text(prompt, task_name, model=None):
     api_key = os.environ.get("LLM_API_KEY", "").strip()
     if not api_key:
         raise LlmConfigurationError("LLM_API_KEY is required for generation")
 
-    model = resolve_model(task_name)
-    if not model:
+    selected_model = model or resolve_model(task_name)
+    if not selected_model:
         raise LlmConfigurationError("LLM model is required for generation")
 
     try:
@@ -182,7 +210,7 @@ def generate_llm_text(prompt, task_name):
             _llm_chat_completions_url(),
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "model": model,
+                "model": selected_model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": DEFAULT_LLM_TEMPERATURE,
             },
@@ -207,8 +235,49 @@ def generate_llm_text(prompt, task_name):
 
 
 def generate_llm_json(prompt, task_name):
-    text = generate_llm_text(prompt, task_name)
-    return parse_json_response(text)
+    models = resolve_models(task_name)
+    if not models:
+        raise LlmConfigurationError("LLM model is required for generation")
+
+    last_error = None
+    for model in models:
+        try:
+            text = generate_llm_text(prompt, task_name, model=model)
+            return parse_json_response(text)
+        except (json.JSONDecodeError, ValueError, LlmGenerationError) as exc:
+            last_error = exc
+            logger.warning("LLM model attempt failed task=%s model=%s error=%s", task_name, model, str(exc))
+
+    if isinstance(last_error, json.JSONDecodeError):
+        raise last_error
+    if isinstance(last_error, ValueError):
+        raise last_error
+    if isinstance(last_error, LlmGenerationError):
+        raise last_error
+    raise LlmGenerationError("LLM generation failed")
+
+
+def generate_valid_llm_result(prompt, task_name, validate_result):
+    models = resolve_models(task_name)
+    if not models:
+        raise LlmConfigurationError("LLM model is required for generation")
+
+    last_error = None
+    for model in models:
+        try:
+            parsed = parse_json_response(generate_llm_text(prompt, task_name, model=model))
+            return validate_result(parsed)
+        except (json.JSONDecodeError, ValueError, LlmGenerationError) as exc:
+            last_error = exc
+            logger.warning("LLM model attempt failed task=%s model=%s error=%s", task_name, model, str(exc))
+
+    if isinstance(last_error, json.JSONDecodeError):
+        raise last_error
+    if isinstance(last_error, ValueError):
+        raise last_error
+    if isinstance(last_error, LlmGenerationError):
+        raise last_error
+    raise LlmGenerationError("LLM generation failed")
 
 
 def parse_json_response(text):
@@ -534,8 +603,16 @@ def create_app():
 
         prompt = build_learning_path_prompt(payload)
 
+        def validate_learning_path(parsed):
+            if not isinstance(parsed, dict):
+                raise LlmGenerationError("LLM returned invalid response shape")
+            learning_path = _filter_learning_path(parsed, payload["constraints"]["allowedLessonIds"])
+            if not learning_path["recommendations"]:
+                raise LlmGenerationError("LLM returned no valid recommendations")
+            return learning_path
+
         try:
-            parsed = generate_llm_json(prompt, "learning_path")
+            learning_path = generate_valid_llm_result(prompt, "learning_path", validate_learning_path)
         except json.JSONDecodeError as exc:
             return jsonify({"error": f"LLM returned invalid JSON: {exc.msg}"}), 502
         except LlmConfigurationError as exc:
@@ -544,13 +621,6 @@ def create_app():
             return jsonify({"error": str(exc)}), 502
         except LlmGenerationError as exc:
             return jsonify({"error": str(exc)}), 502
-
-        if not isinstance(parsed, dict):
-            return jsonify({"error": "LLM returned invalid response shape"}), 502
-
-        learning_path = _filter_learning_path(parsed, payload["constraints"]["allowedLessonIds"])
-        if not learning_path["recommendations"]:
-            return jsonify({"error": "LLM returned no valid recommendations"}), 502
 
         return jsonify(learning_path)
 
@@ -566,8 +636,18 @@ def create_app():
 
         prompt = build_course_recommendation_prompt(payload)
 
+        def validate_course_recommendations(parsed):
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("recommendations"), list):
+                raise LlmGenerationError("LLM returned invalid response shape")
+            course_recommendations = _filter_course_recommendations(parsed, payload["constraints"]["allowedCourseIds"])
+            if not course_recommendations["recommendations"]:
+                raise LlmGenerationError("LLM returned no valid recommendations")
+            return course_recommendations
+
         try:
-            parsed = generate_llm_json(prompt, "course_recommendation")
+            course_recommendations = generate_valid_llm_result(
+                prompt, "course_recommendation", validate_course_recommendations
+            )
         except json.JSONDecodeError as exc:
             return jsonify({"error": f"LLM returned invalid JSON: {exc.msg}"}), 502
         except LlmConfigurationError as exc:
@@ -576,13 +656,6 @@ def create_app():
             return jsonify({"error": str(exc)}), 502
         except LlmGenerationError as exc:
             return jsonify({"error": str(exc)}), 502
-
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("recommendations"), list):
-            return jsonify({"error": "LLM returned invalid response shape"}), 502
-
-        course_recommendations = _filter_course_recommendations(parsed, payload["constraints"]["allowedCourseIds"])
-        if not course_recommendations["recommendations"]:
-            return jsonify({"error": "LLM returned no valid recommendations"}), 502
 
         return jsonify(course_recommendations)
 
@@ -599,8 +672,21 @@ def create_app():
         input_text = payload["inputText"]
         prompt = build_grammar_check_prompt(payload)
 
+        def validate_grammar(parsed):
+            if not isinstance(parsed, dict):
+                raise LlmGenerationError("LLM returned invalid response shape")
+            grammar_result = _filter_grammar_errors(
+                parsed,
+                input_text,
+                set(payload["constraints"]["allowedErrorTypes"]),
+                payload["constraints"].get("maxErrors", DEFAULT_MAX_GRAMMAR_ERRORS),
+            )
+            if grammar_result is None:
+                raise LlmGenerationError("LLM returned invalid response shape")
+            return grammar_result
+
         try:
-            parsed = generate_llm_json(prompt, "grammar")
+            grammar_result = generate_valid_llm_result(prompt, "grammar", validate_grammar)
         except json.JSONDecodeError as exc:
             return jsonify({"error": f"LLM returned invalid JSON: {exc.msg}"}), 502
         except LlmConfigurationError as exc:
@@ -609,18 +695,6 @@ def create_app():
             return jsonify({"error": str(exc)}), 502
         except LlmGenerationError as exc:
             return jsonify({"error": str(exc)}), 502
-
-        if not isinstance(parsed, dict):
-            return jsonify({"error": "LLM returned invalid response shape"}), 502
-
-        grammar_result = _filter_grammar_errors(
-            parsed,
-            input_text,
-            set(payload["constraints"]["allowedErrorTypes"]),
-            payload["constraints"].get("maxErrors", DEFAULT_MAX_GRAMMAR_ERRORS),
-        )
-        if grammar_result is None:
-            return jsonify({"error": "LLM returned invalid response shape"}), 502
 
         return jsonify(grammar_result)
 
@@ -636,8 +710,14 @@ def create_app():
 
         prompt = build_ai_tutor_prompt(payload)
 
+        def validate_tutor(parsed):
+            tutor_result = _filter_ai_tutor_response(parsed)
+            if tutor_result is None:
+                raise LlmGenerationError("LLM returned invalid response shape")
+            return tutor_result
+
         try:
-            parsed = generate_llm_json(prompt, "ai_tutor")
+            tutor_result = generate_valid_llm_result(prompt, "ai_tutor", validate_tutor)
         except json.JSONDecodeError as exc:
             return jsonify({"error": f"LLM returned invalid JSON: {exc.msg}"}), 502
         except LlmConfigurationError as exc:
@@ -646,10 +726,6 @@ def create_app():
             return jsonify({"error": str(exc)}), 502
         except LlmGenerationError as exc:
             return jsonify({"error": str(exc)}), 502
-
-        tutor_result = _filter_ai_tutor_response(parsed)
-        if tutor_result is None:
-            return jsonify({"error": "LLM returned invalid response shape"}), 502
 
         return jsonify(tutor_result)
 

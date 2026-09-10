@@ -8,10 +8,16 @@ Flask service for AI-assisted learning path generation.
 - `LLM_API_KEY`: API key copied from the 9router dashboard. Required for real generation.
 - `LLM_DEFAULT_MODEL`: fallback model when a module-specific model is not configured. The development example is `kr/claude-sonnet-4.5` from the 9router quick-start docs.
 - `LLM_GRAMMAR_MODEL`: optional model override for `POST /grammar-checks/check`.
+- `LLM_GRAMMAR_FALLBACK_MODELS`: comma-separated fallback models for Grammar Check, tried in order.
 - `LLM_AI_TUTOR_MODEL`: optional model override for `POST /ai-tutor/respond`.
+- `LLM_AI_TUTOR_FALLBACK_MODELS`: comma-separated fallback models for AI Tutor, tried in order.
 - `LLM_LEARNING_PATH_MODEL`: optional model override for `POST /learning-path/generate`.
+- `LLM_LEARNING_PATH_FALLBACK_MODELS`: comma-separated fallback models for Learning Path, tried in order.
 - `LLM_COURSE_RECOMMENDATION_MODEL`: optional model override for `POST /course-recommendations/generate`.
-- `LLM_TIMEOUT_MS`: outbound timeout for AI Service calls to 9router. Defaults to `8000`.
+- `LLM_COURSE_RECOMMENDATION_FALLBACK_MODELS`: comma-separated fallback models for Course Recommendation, tried in order.
+- `LLM_TIMEOUT_MS`: outbound timeout for AI Service calls to 9router. Defaults to `8000` in code; Docker examples use `30000` for free models.
+
+Fallback model values are comma-separated. Empty entries are ignored, and duplicate models are skipped while preserving order.
 
 9router itself is configured from `infra/.env`:
 
