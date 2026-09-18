@@ -7,10 +7,21 @@ from app import build_learning_path_prompt, create_app, parse_json_response
 
 
 @pytest.fixture()
-def client():
+def client(monkeypatch):
+    monkeypatch.delenv("AI_SERVICE_INTERNAL_TOKEN", raising=False)
     app = create_app()
     app.config.update(TESTING=True)
     return app.test_client()
+
+
+@pytest.fixture()
+def exported_internal_token(monkeypatch):
+    monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", "external-token")
+
+
+@pytest.fixture()
+def client_with_exported_internal_token(exported_internal_token, client):
+    return client
 
 
 def test_health_returns_ok(client):
@@ -18,6 +29,89 @@ def test_health_returns_ok(client):
 
     assert response.status_code == 200
     assert response.get_json() == {"status": "ok"}
+
+
+GENERATION_ENDPOINTS = [
+    "/learning-path/generate",
+    "/course-recommendations/generate",
+    "/grammar-checks/check",
+    "/ai-tutor/respond",
+]
+
+
+@pytest.mark.parametrize("endpoint", GENERATION_ENDPOINTS)
+def test_internal_token_required_when_env_set(client, monkeypatch, endpoint):
+    monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", "secret-token")
+
+    response = client.post(endpoint, data="not-json")
+
+    assert response.status_code == 401
+    assert response.get_json() == {"error": "Unauthorized"}
+
+
+@pytest.mark.parametrize("endpoint", GENERATION_ENDPOINTS)
+def test_internal_token_rejects_wrong_token(client, monkeypatch, endpoint):
+    monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", "secret-token")
+
+    response = client.post(endpoint, data="not-json", headers={"X-Internal-Service-Token": "wrong-token"})
+
+    assert response.status_code == 401
+    assert response.get_json() == {"error": "Unauthorized"}
+
+
+@pytest.mark.parametrize("endpoint", GENERATION_ENDPOINTS)
+def test_internal_token_rejects_wrong_non_ascii_token(client, monkeypatch, endpoint):
+    monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", "secret-token")
+
+    response = client.post(endpoint, data="not-json", headers={"X-Internal-Service-Token": "wrong-token-é"})
+
+    assert response.status_code == 401
+    assert response.get_json() == {"error": "Unauthorized"}
+
+
+@pytest.mark.parametrize("endpoint", GENERATION_ENDPOINTS)
+def test_internal_token_correct_token_proceeds_past_auth(client, monkeypatch, endpoint):
+    monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", "secret-token")
+
+    response = client.post(endpoint, data="not-json", headers={"X-Internal-Service-Token": "secret-token"})
+
+    assert response.status_code == 400
+    assert "JSON" in response.get_json()["error"]
+
+
+def test_health_does_not_require_internal_token(client, monkeypatch):
+    monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", "secret-token")
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"status": "ok"}
+
+
+@pytest.mark.parametrize("env_value", [None, "", "   "])
+def test_internal_token_unset_or_blank_preserves_dev_behavior(client, monkeypatch, env_value):
+    if env_value is None:
+        monkeypatch.delenv("AI_SERVICE_INTERNAL_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", env_value)
+
+    response = client.post("/learning-path/generate", data="not-json")
+
+    assert response.status_code == 400
+    assert "JSON" in response.get_json()["error"]
+
+
+def test_default_client_fixture_ignores_exported_internal_token(client_with_exported_internal_token):
+    response = client_with_exported_internal_token.post("/learning-path/generate", data="not-json")
+
+    assert response.status_code == 400
+    assert "JSON" in response.get_json()["error"]
+
+
+def test_create_app_sets_json_body_size_limit():
+    app = create_app()
+
+    assert app.config["MAX_CONTENT_LENGTH"] == 1 * 1024 * 1024
 
 
 def test_generate_rejects_missing_json(client):
@@ -204,6 +298,32 @@ data: [DONE]
     assert ai_app.generate_llm_text("Return JSON", "grammar") == '{"errors":[]}'
 
 
+def test_generate_llm_text_skips_streaming_chunks_without_content(monkeypatch):
+    class FakeResponse:
+        text = """data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":" world"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+"""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            raise ValueError("not json")
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_GRAMMAR_MODEL", "grammar-model")
+    monkeypatch.setattr("app.requests.post", lambda *args, **kwargs: FakeResponse())
+
+    assert ai_app.generate_llm_text("Return JSON", "grammar") == "Hello world"
+
+
 def test_generate_llm_text_extracts_json_before_done_marker(monkeypatch):
     class FakeResponse:
         text = '{"choices":[{"message":{"content":"{\\"errors\\": []}"}}]}data: [DONE]'
@@ -315,6 +435,107 @@ def test_generate_course_recommendations_rejects_non_numeric_allowed_ids(client)
     assert "constraints.allowedCourseIds" in response.get_json()["error"]
 
 
+@pytest.mark.parametrize("invalid_id", [{"id": 1}, -1, 0, True, "1", 1.5, [1]])
+def test_generate_rejects_invalid_allowed_lesson_id_before_prompt(client, monkeypatch, invalid_id):
+    def fail_prompt(_payload):
+        raise AssertionError("prompt should not be built for invalid allowedLessonIds")
+
+    monkeypatch.setattr("app.build_learning_path_prompt", fail_prompt)
+
+    response = client.post(
+        "/learning-path/generate",
+        json={"candidateLessons": [{"id": 1}], "constraints": {"allowedLessonIds": [invalid_id]}},
+    )
+
+    assert response.status_code == 400
+    assert "constraints.allowedLessonIds" in response.get_json()["error"]
+
+
+@pytest.mark.parametrize("invalid_id", [{"id": 1}, -1, 0, True, 1.5, [1]])
+def test_generate_course_recommendations_rejects_invalid_allowed_course_id_before_prompt(
+    client, monkeypatch, invalid_id
+):
+    def fail_prompt(_payload):
+        raise AssertionError("prompt should not be built for invalid allowedCourseIds")
+
+    monkeypatch.setattr("app.build_course_recommendation_prompt", fail_prompt)
+
+    response = client.post(
+        "/course-recommendations/generate",
+        json={"candidateCourses": [{"courseId": 1}], "constraints": {"allowedCourseIds": [invalid_id]}},
+    )
+
+    assert response.status_code == 400
+    assert "constraints.allowedCourseIds" in response.get_json()["error"]
+
+
+def test_generate_rejects_too_many_candidate_lessons_before_prompt(client, monkeypatch):
+    def fail_prompt(_payload):
+        raise AssertionError("prompt should not be built for oversized candidateLessons")
+
+    monkeypatch.setattr("app.build_learning_path_prompt", fail_prompt)
+
+    response = client.post(
+        "/learning-path/generate",
+        json={
+            "candidateLessons": [{"id": lesson_id} for lesson_id in range(1, 102)],
+            "constraints": {"allowedLessonIds": [1]},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "candidateLessons" in response.get_json()["error"]
+
+
+def test_generate_course_recommendations_rejects_too_many_candidate_courses_before_prompt(client, monkeypatch):
+    def fail_prompt(_payload):
+        raise AssertionError("prompt should not be built for oversized candidateCourses")
+
+    monkeypatch.setattr("app.build_course_recommendation_prompt", fail_prompt)
+
+    response = client.post(
+        "/course-recommendations/generate",
+        json={
+            "candidateCourses": [{"courseId": course_id} for course_id in range(1, 102)],
+            "constraints": {"allowedCourseIds": [1]},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "candidateCourses" in response.get_json()["error"]
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "payload", "expected_error"),
+    [
+        (
+            "/learning-path/generate",
+            {"candidateLessons": [{"id": 1}], "constraints": {"allowedLessonIds": list(range(1, 102))}},
+            "constraints.allowedLessonIds",
+        ),
+        (
+            "/course-recommendations/generate",
+            {"candidateCourses": [{"courseId": 1}], "constraints": {"allowedCourseIds": list(range(1, 102))}},
+            "constraints.allowedCourseIds",
+        ),
+    ],
+)
+def test_generate_rejects_too_many_allowed_ids_before_prompt(client, monkeypatch, endpoint, payload, expected_error):
+    monkeypatch.setattr(
+        "app.build_learning_path_prompt",
+        lambda _payload: (_ for _ in ()).throw(AssertionError("prompt should not be built")),
+    )
+    monkeypatch.setattr(
+        "app.build_course_recommendation_prompt",
+        lambda _payload: (_ for _ in ()).throw(AssertionError("prompt should not be built")),
+    )
+
+    response = client.post(endpoint, json=payload)
+
+    assert response.status_code == 400
+    assert expected_error in response.get_json()["error"]
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_error"),
     [
@@ -341,11 +562,11 @@ def test_generate_filters_invalid_and_duplicate_recommendations(client, monkeypa
             "recommendations": [
                 {"lessonId": 12, "score": 0.8, "reason": "Practice arrays"},
                 {"lessonId": "12", "score": 0.75, "reason": "Stringified numeric ID"},
-                {"lessonId": "l2", "score": 0.7, "reason": "Not allowed"},
+                {"lessonId": 13, "score": 0.7, "reason": "Not allowed"},
                 {"lessonId": 12, "score": 0.6, "reason": "Duplicate"},
-                {"lessonId": "l3", "score": 2, "reason": "Bad score"},
-                {"lessonId": "l4", "score": 0.5},
-                {"lessonId": "l5", "score": 0.4, "reason": "   "},
+                {"lessonId": 14, "score": 2, "reason": "Bad score"},
+                {"lessonId": 15, "score": 0.5},
+                {"lessonId": 16, "score": 0.4, "reason": "   "},
             ],
         }
     )
@@ -357,12 +578,12 @@ def test_generate_filters_invalid_and_duplicate_recommendations(client, monkeypa
         json={
             "candidateLessons": [
                 {"id": 12, "title": "Arrays"},
-                {"id": "l2", "title": "Loops"},
-                {"id": "l3", "title": "Functions"},
-                {"id": "l4", "title": "Objects"},
-                {"id": "l5", "title": "Classes"},
+                {"id": 13, "title": "Loops"},
+                {"id": 14, "title": "Functions"},
+                {"id": 15, "title": "Objects"},
+                {"id": 16, "title": "Classes"},
             ],
-            "constraints": {"allowedLessonIds": [12, "l4", "l5"]},
+            "constraints": {"allowedLessonIds": [12, 15, 16]},
         },
     )
 
@@ -374,12 +595,12 @@ def test_generate_filters_invalid_and_duplicate_recommendations(client, monkeypa
         "recommendations": [
             {"lessonId": 12, "score": 0.8, "reason": "Practice arrays"},
             {
-                "lessonId": "l4",
+                "lessonId": 15,
                 "score": 0.5,
                 "reason": "Recommended based on recent learning history.",
             },
             {
-                "lessonId": "l5",
+                "lessonId": 16,
                 "score": 0.4,
                 "reason": "Recommended based on recent learning history.",
             },
@@ -473,7 +694,7 @@ def test_generate_returns_bad_gateway_when_filtering_removes_all_recommendations
             "weaknesses": ["arrays"],
             "recommendations": [
                 {"lessonId": "l2", "score": 0.8, "reason": "Not allowed"},
-                {"lessonId": "l1", "score": 2, "reason": "Bad score"},
+                {"lessonId": 1, "score": 2, "reason": "Bad score"},
             ],
         }
     )
@@ -483,8 +704,8 @@ def test_generate_returns_bad_gateway_when_filtering_removes_all_recommendations
     response = client.post(
         "/learning-path/generate",
         json={
-            "candidateLessons": [{"id": "l1", "title": "Arrays"}],
-            "constraints": {"allowedLessonIds": ["l1"]},
+            "candidateLessons": [{"id": 1, "title": "Arrays"}],
+            "constraints": {"allowedLessonIds": [1]},
         },
     )
 
@@ -503,8 +724,8 @@ def test_generate_hides_raw_llm_exception_details(client, monkeypatch):
     response = client.post(
         "/learning-path/generate",
         json={
-            "candidateLessons": [{"id": "l1", "title": "Arrays"}],
-            "constraints": {"allowedLessonIds": ["l1"]},
+            "candidateLessons": [{"id": 1, "title": "Arrays"}],
+            "constraints": {"allowedLessonIds": [1]},
         },
     )
 
@@ -518,8 +739,8 @@ def test_generate_returns_bad_gateway_when_llm_json_is_not_object(client, monkey
     response = client.post(
         "/learning-path/generate",
         json={
-            "candidateLessons": [{"id": "l1", "title": "Arrays"}],
-            "constraints": {"allowedLessonIds": ["l1"]},
+            "candidateLessons": [{"id": 1, "title": "Arrays"}],
+            "constraints": {"allowedLessonIds": [1]},
         },
     )
 
