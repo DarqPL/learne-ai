@@ -337,7 +337,7 @@ def test_generate_rejects_invalid_allowed_lesson_id_before_prompt(client, monkey
     assert "constraints.allowedLessonIds" in response.get_json()["error"]
 
 
-@pytest.mark.parametrize("invalid_id", [-1, 0, True, 1.5])
+@pytest.mark.parametrize("invalid_id", [{"id": 1}, -1, 0, True, 1.5, [1]])
 def test_generate_course_recommendations_rejects_invalid_allowed_course_id_before_prompt(
     client, monkeypatch, invalid_id
 ):
