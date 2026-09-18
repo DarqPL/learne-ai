@@ -9,6 +9,10 @@ import requests
 
 DEFAULT_RECOMMENDATION_REASON = "Recommended based on recent learning history."
 GRAMMAR_ERROR_TYPES = {"GRAMMAR", "SPELLING", "PUNCTUATION", "WORD_CHOICE", "STYLE", "OTHER"}
+MAX_JSON_BODY_BYTES = 1 * 1024 * 1024
+MAX_CANDIDATE_LESSONS = 100
+MAX_CANDIDATE_COURSES = 100
+MAX_ALLOWED_IDS = 100
 MAX_GRAMMAR_INPUT_LENGTH = 2000
 DEFAULT_MAX_GRAMMAR_ERRORS = 20
 MAX_GRAMMAR_ERROR_FIELD_LENGTH = 500
@@ -338,6 +342,8 @@ def _validate_payload(payload):
         return "candidateLessons must be an array"
     if not candidate_lessons:
         return "candidateLessons must be a non-empty array"
+    if len(candidate_lessons) > MAX_CANDIDATE_LESSONS:
+        return "candidateLessons must contain at most 100 items"
 
     constraints = payload.get("constraints")
     if not isinstance(constraints, dict):
@@ -348,6 +354,10 @@ def _validate_payload(payload):
         return "constraints.allowedLessonIds must be an array"
     if not allowed_lesson_ids:
         return "constraints.allowedLessonIds must be a non-empty array"
+    if len(allowed_lesson_ids) > MAX_ALLOWED_IDS:
+        return "constraints.allowedLessonIds must contain at most 100 items"
+    if any(not _is_positive_int(lesson_id) for lesson_id in allowed_lesson_ids):
+        return "constraints.allowedLessonIds must contain only positive integers"
 
     return None
 
@@ -361,6 +371,8 @@ def _validate_course_payload(payload):
         return "candidateCourses must be an array"
     if not candidate_courses:
         return "candidateCourses must be a non-empty array"
+    if len(candidate_courses) > MAX_CANDIDATE_COURSES:
+        return "candidateCourses must contain at most 100 items"
 
     constraints = payload.get("constraints")
     if not isinstance(constraints, dict):
@@ -371,10 +383,16 @@ def _validate_course_payload(payload):
         return "constraints.allowedCourseIds must be an array"
     if not allowed_course_ids:
         return "constraints.allowedCourseIds must be a non-empty array"
-    if any(isinstance(course_id, bool) or not isinstance(course_id, (int, float)) for course_id in allowed_course_ids):
-        return "constraints.allowedCourseIds must contain only numbers"
+    if len(allowed_course_ids) > MAX_ALLOWED_IDS:
+        return "constraints.allowedCourseIds must contain at most 100 items"
+    if any(not _is_positive_int(course_id) for course_id in allowed_course_ids):
+        return "constraints.allowedCourseIds must contain only positive integers"
 
     return None
+
+
+def _is_positive_int(value):
+    return not isinstance(value, bool) and isinstance(value, int) and value > 0
 
 
 def _validate_grammar_payload(payload):
@@ -623,6 +641,7 @@ def _filter_ai_tutor_response(parsed):
 
 def create_app():
     app = Flask(__name__)
+    app.config["MAX_CONTENT_LENGTH"] = MAX_JSON_BODY_BYTES
 
     @app.get("/health")
     def health():

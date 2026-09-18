@@ -20,6 +20,12 @@ def test_health_returns_ok(client):
     assert response.get_json() == {"status": "ok"}
 
 
+def test_create_app_sets_json_body_size_limit():
+    app = create_app()
+
+    assert app.config["MAX_CONTENT_LENGTH"] == 1 * 1024 * 1024
+
+
 def test_generate_rejects_missing_json(client):
     response = client.post("/learning-path/generate", data="not-json")
 
@@ -315,6 +321,107 @@ def test_generate_course_recommendations_rejects_non_numeric_allowed_ids(client)
     assert "constraints.allowedCourseIds" in response.get_json()["error"]
 
 
+@pytest.mark.parametrize("invalid_id", [{"id": 1}, -1, 0, True, "1", 1.5, [1]])
+def test_generate_rejects_invalid_allowed_lesson_id_before_prompt(client, monkeypatch, invalid_id):
+    def fail_prompt(_payload):
+        raise AssertionError("prompt should not be built for invalid allowedLessonIds")
+
+    monkeypatch.setattr("app.build_learning_path_prompt", fail_prompt)
+
+    response = client.post(
+        "/learning-path/generate",
+        json={"candidateLessons": [{"id": 1}], "constraints": {"allowedLessonIds": [invalid_id]}},
+    )
+
+    assert response.status_code == 400
+    assert "constraints.allowedLessonIds" in response.get_json()["error"]
+
+
+@pytest.mark.parametrize("invalid_id", [-1, 0, True, 1.5])
+def test_generate_course_recommendations_rejects_invalid_allowed_course_id_before_prompt(
+    client, monkeypatch, invalid_id
+):
+    def fail_prompt(_payload):
+        raise AssertionError("prompt should not be built for invalid allowedCourseIds")
+
+    monkeypatch.setattr("app.build_course_recommendation_prompt", fail_prompt)
+
+    response = client.post(
+        "/course-recommendations/generate",
+        json={"candidateCourses": [{"courseId": 1}], "constraints": {"allowedCourseIds": [invalid_id]}},
+    )
+
+    assert response.status_code == 400
+    assert "constraints.allowedCourseIds" in response.get_json()["error"]
+
+
+def test_generate_rejects_too_many_candidate_lessons_before_prompt(client, monkeypatch):
+    def fail_prompt(_payload):
+        raise AssertionError("prompt should not be built for oversized candidateLessons")
+
+    monkeypatch.setattr("app.build_learning_path_prompt", fail_prompt)
+
+    response = client.post(
+        "/learning-path/generate",
+        json={
+            "candidateLessons": [{"id": lesson_id} for lesson_id in range(1, 102)],
+            "constraints": {"allowedLessonIds": [1]},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "candidateLessons" in response.get_json()["error"]
+
+
+def test_generate_course_recommendations_rejects_too_many_candidate_courses_before_prompt(client, monkeypatch):
+    def fail_prompt(_payload):
+        raise AssertionError("prompt should not be built for oversized candidateCourses")
+
+    monkeypatch.setattr("app.build_course_recommendation_prompt", fail_prompt)
+
+    response = client.post(
+        "/course-recommendations/generate",
+        json={
+            "candidateCourses": [{"courseId": course_id} for course_id in range(1, 102)],
+            "constraints": {"allowedCourseIds": [1]},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "candidateCourses" in response.get_json()["error"]
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "payload", "expected_error"),
+    [
+        (
+            "/learning-path/generate",
+            {"candidateLessons": [{"id": 1}], "constraints": {"allowedLessonIds": list(range(1, 102))}},
+            "constraints.allowedLessonIds",
+        ),
+        (
+            "/course-recommendations/generate",
+            {"candidateCourses": [{"courseId": 1}], "constraints": {"allowedCourseIds": list(range(1, 102))}},
+            "constraints.allowedCourseIds",
+        ),
+    ],
+)
+def test_generate_rejects_too_many_allowed_ids_before_prompt(client, monkeypatch, endpoint, payload, expected_error):
+    monkeypatch.setattr(
+        "app.build_learning_path_prompt",
+        lambda _payload: (_ for _ in ()).throw(AssertionError("prompt should not be built")),
+    )
+    monkeypatch.setattr(
+        "app.build_course_recommendation_prompt",
+        lambda _payload: (_ for _ in ()).throw(AssertionError("prompt should not be built")),
+    )
+
+    response = client.post(endpoint, json=payload)
+
+    assert response.status_code == 400
+    assert expected_error in response.get_json()["error"]
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_error"),
     [
@@ -341,11 +448,11 @@ def test_generate_filters_invalid_and_duplicate_recommendations(client, monkeypa
             "recommendations": [
                 {"lessonId": 12, "score": 0.8, "reason": "Practice arrays"},
                 {"lessonId": "12", "score": 0.75, "reason": "Stringified numeric ID"},
-                {"lessonId": "l2", "score": 0.7, "reason": "Not allowed"},
+                {"lessonId": 13, "score": 0.7, "reason": "Not allowed"},
                 {"lessonId": 12, "score": 0.6, "reason": "Duplicate"},
-                {"lessonId": "l3", "score": 2, "reason": "Bad score"},
-                {"lessonId": "l4", "score": 0.5},
-                {"lessonId": "l5", "score": 0.4, "reason": "   "},
+                {"lessonId": 14, "score": 2, "reason": "Bad score"},
+                {"lessonId": 15, "score": 0.5},
+                {"lessonId": 16, "score": 0.4, "reason": "   "},
             ],
         }
     )
@@ -357,12 +464,12 @@ def test_generate_filters_invalid_and_duplicate_recommendations(client, monkeypa
         json={
             "candidateLessons": [
                 {"id": 12, "title": "Arrays"},
-                {"id": "l2", "title": "Loops"},
-                {"id": "l3", "title": "Functions"},
-                {"id": "l4", "title": "Objects"},
-                {"id": "l5", "title": "Classes"},
+                {"id": 13, "title": "Loops"},
+                {"id": 14, "title": "Functions"},
+                {"id": 15, "title": "Objects"},
+                {"id": 16, "title": "Classes"},
             ],
-            "constraints": {"allowedLessonIds": [12, "l4", "l5"]},
+            "constraints": {"allowedLessonIds": [12, 15, 16]},
         },
     )
 
@@ -374,12 +481,12 @@ def test_generate_filters_invalid_and_duplicate_recommendations(client, monkeypa
         "recommendations": [
             {"lessonId": 12, "score": 0.8, "reason": "Practice arrays"},
             {
-                "lessonId": "l4",
+                "lessonId": 15,
                 "score": 0.5,
                 "reason": "Recommended based on recent learning history.",
             },
             {
-                "lessonId": "l5",
+                "lessonId": 16,
                 "score": 0.4,
                 "reason": "Recommended based on recent learning history.",
             },
@@ -473,7 +580,7 @@ def test_generate_returns_bad_gateway_when_filtering_removes_all_recommendations
             "weaknesses": ["arrays"],
             "recommendations": [
                 {"lessonId": "l2", "score": 0.8, "reason": "Not allowed"},
-                {"lessonId": "l1", "score": 2, "reason": "Bad score"},
+                {"lessonId": 1, "score": 2, "reason": "Bad score"},
             ],
         }
     )
@@ -483,8 +590,8 @@ def test_generate_returns_bad_gateway_when_filtering_removes_all_recommendations
     response = client.post(
         "/learning-path/generate",
         json={
-            "candidateLessons": [{"id": "l1", "title": "Arrays"}],
-            "constraints": {"allowedLessonIds": ["l1"]},
+            "candidateLessons": [{"id": 1, "title": "Arrays"}],
+            "constraints": {"allowedLessonIds": [1]},
         },
     )
 
@@ -503,8 +610,8 @@ def test_generate_hides_raw_llm_exception_details(client, monkeypatch):
     response = client.post(
         "/learning-path/generate",
         json={
-            "candidateLessons": [{"id": "l1", "title": "Arrays"}],
-            "constraints": {"allowedLessonIds": ["l1"]},
+            "candidateLessons": [{"id": 1, "title": "Arrays"}],
+            "constraints": {"allowedLessonIds": [1]},
         },
     )
 
@@ -518,8 +625,8 @@ def test_generate_returns_bad_gateway_when_llm_json_is_not_object(client, monkey
     response = client.post(
         "/learning-path/generate",
         json={
-            "candidateLessons": [{"id": "l1", "title": "Arrays"}],
-            "constraints": {"allowedLessonIds": ["l1"]},
+            "candidateLessons": [{"id": 1, "title": "Arrays"}],
+            "constraints": {"allowedLessonIds": [1]},
         },
     )
 
