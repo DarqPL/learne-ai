@@ -210,14 +210,20 @@ def _llm_chat_completions_url():
 def _extract_llm_content(payload):
     try:
         choice = payload["choices"][0]
-        message = choice.get("message")
-        if isinstance(message, dict) and isinstance(message.get("content"), str):
-            return message["content"]
-        delta = choice.get("delta")
-        if isinstance(delta, dict) and isinstance(delta.get("content"), str):
-            return delta["content"]
     except (KeyError, IndexError, TypeError, AttributeError) as exc:
         raise LlmGenerationError("LLM returned invalid response shape") from exc
+
+    if not isinstance(choice, dict):
+        raise LlmGenerationError("LLM returned invalid response shape")
+
+    message = choice.get("message")
+    if isinstance(message, dict) and isinstance(message.get("content"), str):
+        return message["content"]
+
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        content = delta.get("content")
+        return content if isinstance(content, str) else ""
 
     raise LlmGenerationError("LLM returned invalid response shape")
 

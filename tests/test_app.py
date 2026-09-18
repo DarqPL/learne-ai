@@ -298,6 +298,32 @@ data: [DONE]
     assert ai_app.generate_llm_text("Return JSON", "grammar") == '{"errors":[]}'
 
 
+def test_generate_llm_text_skips_streaming_chunks_without_content(monkeypatch):
+    class FakeResponse:
+        text = """data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":" world"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+"""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            raise ValueError("not json")
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_GRAMMAR_MODEL", "grammar-model")
+    monkeypatch.setattr("app.requests.post", lambda *args, **kwargs: FakeResponse())
+
+    assert ai_app.generate_llm_text("Return JSON", "grammar") == "Hello world"
+
+
 def test_generate_llm_text_extracts_json_before_done_marker(monkeypatch):
     class FakeResponse:
         text = '{"choices":[{"message":{"content":"{\\"errors\\": []}"}}]}data: [DONE]'
