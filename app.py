@@ -1,3 +1,4 @@
+import hmac
 import json
 import logging
 import os
@@ -35,6 +36,12 @@ LLM_TASK_FALLBACK_ENV = {
     "ai_tutor": "LLM_AI_TUTOR_FALLBACK_MODELS",
     "learning_path": "LLM_LEARNING_PATH_FALLBACK_MODELS",
     "course_recommendation": "LLM_COURSE_RECOMMENDATION_FALLBACK_MODELS",
+}
+GENERATION_ENDPOINTS = {
+    "/learning-path/generate",
+    "/course-recommendations/generate",
+    "/grammar-checks/check",
+    "/ai-tutor/respond",
 }
 DEFAULT_LLM_BASE_URL = "http://9router:20128/v1"
 DEFAULT_LLM_TIMEOUT_MS = 8000
@@ -642,6 +649,18 @@ def _filter_ai_tutor_response(parsed):
 def create_app():
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_JSON_BODY_BYTES
+
+    @app.before_request
+    def require_internal_token():
+        expected_token = os.environ.get("AI_SERVICE_INTERNAL_TOKEN", "").strip()
+        if not expected_token or request.path not in GENERATION_ENDPOINTS:
+            return None
+
+        provided_token = request.headers.get("X-Internal-Service-Token", "")
+        if not hmac.compare_digest(provided_token, expected_token):
+            return jsonify({"error": "Unauthorized"}), 401
+
+        return None
 
     @app.get("/health")
     def health():

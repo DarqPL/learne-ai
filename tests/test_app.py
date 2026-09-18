@@ -20,6 +20,66 @@ def test_health_returns_ok(client):
     assert response.get_json() == {"status": "ok"}
 
 
+GENERATION_ENDPOINTS = [
+    "/learning-path/generate",
+    "/course-recommendations/generate",
+    "/grammar-checks/check",
+    "/ai-tutor/respond",
+]
+
+
+@pytest.mark.parametrize("endpoint", GENERATION_ENDPOINTS)
+def test_internal_token_required_when_env_set(client, monkeypatch, endpoint):
+    monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", "secret-token")
+
+    response = client.post(endpoint, data="not-json")
+
+    assert response.status_code == 401
+    assert response.get_json() == {"error": "Unauthorized"}
+
+
+@pytest.mark.parametrize("endpoint", GENERATION_ENDPOINTS)
+def test_internal_token_rejects_wrong_token(client, monkeypatch, endpoint):
+    monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", "secret-token")
+
+    response = client.post(endpoint, data="not-json", headers={"X-Internal-Service-Token": "wrong-token"})
+
+    assert response.status_code == 401
+    assert response.get_json() == {"error": "Unauthorized"}
+
+
+@pytest.mark.parametrize("endpoint", GENERATION_ENDPOINTS)
+def test_internal_token_correct_token_proceeds_past_auth(client, monkeypatch, endpoint):
+    monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", "secret-token")
+
+    response = client.post(endpoint, data="not-json", headers={"X-Internal-Service-Token": "secret-token"})
+
+    assert response.status_code == 400
+    assert "JSON" in response.get_json()["error"]
+
+
+def test_health_does_not_require_internal_token(client, monkeypatch):
+    monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", "secret-token")
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"status": "ok"}
+
+
+@pytest.mark.parametrize("env_value", [None, "", "   "])
+def test_internal_token_unset_or_blank_preserves_dev_behavior(client, monkeypatch, env_value):
+    if env_value is None:
+        monkeypatch.delenv("AI_SERVICE_INTERNAL_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", env_value)
+
+    response = client.post("/learning-path/generate", data="not-json")
+
+    assert response.status_code == 400
+    assert "JSON" in response.get_json()["error"]
+
+
 def test_create_app_sets_json_body_size_limit():
     app = create_app()
 
