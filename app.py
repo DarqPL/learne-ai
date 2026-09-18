@@ -657,7 +657,7 @@ def create_app():
             return None
 
         provided_token = request.headers.get("X-Internal-Service-Token", "")
-        if not hmac.compare_digest(provided_token, expected_token):
+        if not hmac.compare_digest(provided_token.encode("utf-8"), expected_token.encode("utf-8")):
             return jsonify({"error": "Unauthorized"}), 401
 
         return None

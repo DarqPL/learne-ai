@@ -7,10 +7,21 @@ from app import build_learning_path_prompt, create_app, parse_json_response
 
 
 @pytest.fixture()
-def client():
+def client(monkeypatch):
+    monkeypatch.delenv("AI_SERVICE_INTERNAL_TOKEN", raising=False)
     app = create_app()
     app.config.update(TESTING=True)
     return app.test_client()
+
+
+@pytest.fixture()
+def exported_internal_token(monkeypatch):
+    monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", "external-token")
+
+
+@pytest.fixture()
+def client_with_exported_internal_token(exported_internal_token, client):
+    return client
 
 
 def test_health_returns_ok(client):
@@ -49,6 +60,16 @@ def test_internal_token_rejects_wrong_token(client, monkeypatch, endpoint):
 
 
 @pytest.mark.parametrize("endpoint", GENERATION_ENDPOINTS)
+def test_internal_token_rejects_wrong_non_ascii_token(client, monkeypatch, endpoint):
+    monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", "secret-token")
+
+    response = client.post(endpoint, data="not-json", headers={"X-Internal-Service-Token": "wrong-token-é"})
+
+    assert response.status_code == 401
+    assert response.get_json() == {"error": "Unauthorized"}
+
+
+@pytest.mark.parametrize("endpoint", GENERATION_ENDPOINTS)
 def test_internal_token_correct_token_proceeds_past_auth(client, monkeypatch, endpoint):
     monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", "secret-token")
 
@@ -75,6 +96,13 @@ def test_internal_token_unset_or_blank_preserves_dev_behavior(client, monkeypatc
         monkeypatch.setenv("AI_SERVICE_INTERNAL_TOKEN", env_value)
 
     response = client.post("/learning-path/generate", data="not-json")
+
+    assert response.status_code == 400
+    assert "JSON" in response.get_json()["error"]
+
+
+def test_default_client_fixture_ignores_exported_internal_token(client_with_exported_internal_token):
+    response = client_with_exported_internal_token.post("/learning-path/generate", data="not-json")
 
     assert response.status_code == 400
     assert "JSON" in response.get_json()["error"]
