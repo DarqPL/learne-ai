@@ -36,6 +36,7 @@ GENERATION_ENDPOINTS = [
     "/course-recommendations/generate",
     "/grammar-checks/check",
     "/ai-tutor/respond",
+    "/course-content/enrich-knowledge-points",
 ]
 
 
@@ -106,6 +107,153 @@ def test_default_client_fixture_ignores_exported_internal_token(client_with_expo
 
     assert response.status_code == 400
     assert "JSON" in response.get_json()["error"]
+
+
+def _course_content_payload():
+    return {
+        "course": {
+            "id": 1,
+            "name": "English A2 Listening",
+            "description": "Numbers and dates",
+            "type": "COMPREHENSIVE",
+            "level": "A2",
+        },
+        "questions": [
+            {
+                "questionId": 101,
+                "topicId": 10,
+                "topicOrderIndex": 1,
+                "topicName": "Numbers",
+                "topicDescription": "",
+                "lessonId": 20,
+                "lessonOrderIndex": 1,
+                "lessonTitle": "Listening for dates",
+                "lessonDescription": "",
+                "lessonContent": "Listen for dates in short conversations.",
+                "skillType": "LISTENING",
+                "questionOrderIndex": 1,
+                "questionType": "MULTIPLE_CHOICE",
+                "questionText": "What date does the speaker mention?",
+                "correctAnswer": "",
+                "options": [
+                    {"optionText": "June 3", "correct": False, "orderIndex": 1},
+                    {"optionText": "June 13", "correct": True, "orderIndex": 2},
+                ],
+            }
+        ],
+    }
+
+
+def test_course_content_rejects_missing_json(client):
+    response = client.post("/course-content/enrich-knowledge-points", data="not-json")
+
+    assert response.status_code == 400
+    assert "JSON" in response.get_json()["error"]
+
+
+def test_course_content_rejects_missing_questions(client):
+    payload = _course_content_payload()
+    payload.pop("questions")
+
+    response = client.post("/course-content/enrich-knowledge-points", json=payload)
+
+    assert response.status_code == 400
+    assert "questions" in response.get_json()["error"]
+
+
+def test_course_content_rejects_duplicate_question_ids(client):
+    payload = _course_content_payload()
+    payload["questions"].append(dict(payload["questions"][0]))
+
+    response = client.post("/course-content/enrich-knowledge-points", json=payload)
+
+    assert response.status_code == 400
+    assert "Duplicate" in response.get_json()["error"]
+
+
+def test_course_content_rejects_blank_course_name(client):
+    payload = _course_content_payload()
+    payload["course"]["name"] = "   "
+
+    response = client.post("/course-content/enrich-knowledge-points", json=payload)
+
+    assert response.status_code == 400
+    assert "course.name" in response.get_json()["error"]
+
+
+def test_course_content_rejects_extra_question_fields(client):
+    payload = _course_content_payload()
+    payload["questions"][0]["extra"] = "not allowed"
+
+    response = client.post("/course-content/enrich-knowledge-points", json=payload)
+
+    assert response.status_code == 400
+    assert "extra" in response.get_json()["error"]
+
+
+def test_course_content_rejects_invalid_enum_values(client):
+    payload = _course_content_payload()
+    payload["course"]["type"] = "NOT_A_TYPE"
+
+    response = client.post("/course-content/enrich-knowledge-points", json=payload)
+
+    assert response.status_code == 400
+    assert "enum" in response.get_json()["error"]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload["course"].update(id=2**63),
+        lambda payload: payload["questions"][0].update(questionId=2**63),
+        lambda payload: payload["questions"][0].update(topicId=2**63),
+        lambda payload: payload["questions"][0].update(lessonId=2**63),
+        lambda payload: payload["questions"][0].update(questionText="   "),
+    ],
+)
+def test_course_content_rejects_out_of_range_ids_and_blank_question_text(client, mutate):
+    payload = _course_content_payload()
+    mutate(payload)
+
+    response = client.post("/course-content/enrich-knowledge-points", json=payload)
+
+    assert response.status_code == 400
+
+
+def test_course_content_returns_valid_knowledge_points(client, monkeypatch):
+    payload = _course_content_payload()
+    response_text = json.dumps({"items": [{"questionId": 101, "knowledgePoint": "Listening Dates"}]})
+    _mock_llm_text(monkeypatch, response_text, "course_content")
+
+    response = client.post("/course-content/enrich-knowledge-points", json=payload)
+
+    assert response.status_code == 200
+    assert response.get_json() == {"items": [{"questionId": 101, "knowledgePoint": "listening_dates"}]}
+
+
+@pytest.mark.parametrize(
+    "llm_payload",
+    [
+        {"items": []},
+        {"items": [{"questionId": 999, "knowledgePoint": "listening_dates"}]},
+        {"items": [{"questionId": 101, "knowledgePoint": ""}]},
+        {"items": [{"questionId": "101", "knowledgePoint": "listening_dates"}]},
+        {"items": [{"questionId": 101, "knowledgePoint": "x" * 65}]},
+    ],
+)
+def test_course_content_rejects_invalid_llm_result(client, monkeypatch, llm_payload):
+    _mock_llm_text(monkeypatch, json.dumps(llm_payload), "course_content")
+
+    response = client.post("/course-content/enrich-knowledge-points", json=_course_content_payload())
+
+    assert response.status_code == 502
+
+
+def test_course_content_uses_module_specific_model(monkeypatch):
+    monkeypatch.setenv("LLM_DEFAULT_MODEL", "default-model")
+    monkeypatch.setenv("LLM_COURSE_CONTENT_MODEL", "course-content-model")
+
+    assert ai_app.resolve_model("course_content") == "course-content-model"
 
 
 def test_create_app_sets_json_body_size_limit():

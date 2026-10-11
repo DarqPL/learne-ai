@@ -15,6 +15,8 @@ Flask service for AI-assisted learning path generation.
 - `LLM_LEARNING_PATH_FALLBACK_MODELS`: comma-separated fallback models for Learning Path, tried in order.
 - `LLM_COURSE_RECOMMENDATION_MODEL`: optional model override for `POST /course-recommendations/generate`.
 - `LLM_COURSE_RECOMMENDATION_FALLBACK_MODELS`: comma-separated fallback models for Course Recommendation, tried in order.
+- `LLM_COURSE_CONTENT_MODEL`: optional model override for `POST /course-content/enrich-knowledge-points`.
+- `LLM_COURSE_CONTENT_FALLBACK_MODELS`: comma-separated fallback models for course content metadata enrichment.
 - `LLM_TIMEOUT_MS`: outbound timeout for AI Service calls to 9router. Defaults to `8000` in code; Docker examples use `30000` for free models.
 
 Fallback model values are comma-separated. Empty entries are ignored, and duplicate models are skipped while preserving order.
@@ -136,3 +138,25 @@ Errors:
 - `400`: invalid JSON or missing/invalid `candidateCourses` or `constraints.allowedCourseIds`.
 - `503`: `LLM_API_KEY` or an LLM model is not configured.
 - `502`: LLM call fails, returns invalid JSON, returns an invalid response shape, or returns no valid recommendations.
+
+### `POST /course-content/enrich-knowledge-points`
+
+Internal endpoint called by the backend when a teacher submits a course for review. It receives one course context and
+up to 25 questions per request, then returns one concise `knowledgePoint` label per question. Requests must include the
+`X-Internal-Service-Token` header when `AI_SERVICE_INTERNAL_TOKEN` is configured.
+
+Response body:
+
+```json
+{
+  "items": [
+    {"questionId": 987, "knowledgePoint": "listening_dates"}
+  ]
+}
+```
+
+Errors:
+
+- `400`: invalid JSON, missing required course/question fields, duplicate IDs, or a batch larger than 25 questions.
+- `503`: `LLM_API_KEY` or an LLM model is not configured.
+- `502`: the LLM call fails or returns malformed, incomplete, duplicate, unknown, blank, or oversized metadata.
