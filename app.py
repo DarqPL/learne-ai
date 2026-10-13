@@ -25,23 +25,34 @@ MAX_AI_TUTOR_RECENT_MESSAGE_LENGTH = 4000
 MAX_AI_TUTOR_REPLY_LENGTH = 4000
 MAX_AI_TUTOR_FEEDBACK_LENGTH = 1000
 MAX_AI_TUTOR_RECENT_MESSAGES = 10
+MAX_COURSE_CONTENT_QUESTIONS = 25
+MAX_KNOWLEDGE_POINT_LENGTH = 64
+MAX_COURSE_CONTENT_OPTIONS = 8
+COURSE_CONTENT_COURSE_TYPES = {"COMPREHENSIVE", "GRAMMAR", "VOCABULARY", "LISTENING", "SPEAKING", "READING", "WRITING", "PRONUNCIATION"}
+COURSE_CONTENT_SKILL_TYPES = {"READING", "LISTENING", "SPEAKING", "WRITING", "GRAMMAR", "VOCABULARY", "PRONUNCIATION"}
+COURSE_CONTENT_QUESTION_TYPES = {
+    "MULTIPLE_CHOICE", "FILL_BLANK", "WORD_ORDER", "TRANSLATION", "TRUE_FALSE", "SHORT_ANSWER", "PRONUNCIATION",
+}
 LLM_TASK_MODEL_ENV = {
     "grammar": "LLM_GRAMMAR_MODEL",
     "ai_tutor": "LLM_AI_TUTOR_MODEL",
     "learning_path": "LLM_LEARNING_PATH_MODEL",
     "course_recommendation": "LLM_COURSE_RECOMMENDATION_MODEL",
+    "course_content": "LLM_COURSE_CONTENT_MODEL",
 }
 LLM_TASK_FALLBACK_ENV = {
     "grammar": "LLM_GRAMMAR_FALLBACK_MODELS",
     "ai_tutor": "LLM_AI_TUTOR_FALLBACK_MODELS",
     "learning_path": "LLM_LEARNING_PATH_FALLBACK_MODELS",
     "course_recommendation": "LLM_COURSE_RECOMMENDATION_FALLBACK_MODELS",
+    "course_content": "LLM_COURSE_CONTENT_FALLBACK_MODELS",
 }
 GENERATION_ENDPOINTS = {
     "/learning-path/generate",
     "/course-recommendations/generate",
     "/grammar-checks/check",
     "/ai-tutor/respond",
+    "/course-content/enrich-knowledge-points",
 }
 DEFAULT_LLM_BASE_URL = "http://9router:20128/v1"
 DEFAULT_LLM_TIMEOUT_MS = 8000
@@ -150,6 +161,29 @@ Rules:
 - practiceType ROLEPLAY means stay in the scenario from title.
 - practiceType WRITING_PRACTICE means respond to the writing helpfully and gently.
 - feedback.errorType must be one of GRAMMAR, VOCABULARY, WORD_CHOICE, STYLE, OTHER.
+- Do not include markdown, commentary, or extra keys.
+
+Input:
+{json.dumps(payload, ensure_ascii=False)}
+"""
+
+
+def build_course_content_prompt(payload):
+    return f"""You are an AI tutor identifying reusable English learning knowledge points.
+
+Return only valid JSON with this shape:
+{{
+  "items": [
+    {{"questionId": 123, "knowledgePoint": "listening_dates"}}
+  ]
+}}
+
+Rules:
+- Return exactly one item for every input questionId.
+- questionId must be a number from the input.
+- Use short snake_case labels describing the English skill or language concept.
+- Do not include course-specific IDs, names, or long descriptions.
+- Keep each knowledgePoint no longer than 64 characters.
 - Do not include markdown, commentary, or extra keys.
 
 Input:
@@ -408,6 +442,10 @@ def _is_positive_int(value):
     return not isinstance(value, bool) and isinstance(value, int) and value > 0
 
 
+def _is_positive_long(value):
+    return _is_positive_int(value) and value <= (2**63 - 1)
+
+
 def _validate_grammar_payload(payload):
     if not isinstance(payload, dict):
         return "Request body must be a JSON object"
@@ -471,6 +509,134 @@ def _validate_ai_tutor_payload(payload):
             return "recentMessages contains an invalid message"
 
     return None
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_course_content_payload(payload):
+    if not isinstance(payload, dict):
+        return "JSON body must be an object."
+
+    course = payload.get("course")
+    if not isinstance(course, dict):
+        return "course is required."
+    if "questions" not in payload:
+        return "questions must contain at least one item."
+    if set(payload) != {"course", "questions"}:
+        return "Request contains extra or missing top-level fields."
+    course_fields = {"id", "name", "description", "type", "level"}
+    if set(course) != course_fields:
+        return "course contains extra or missing fields."
+    questions = payload.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return "questions must contain at least one item."
+    if len(questions) > MAX_COURSE_CONTENT_QUESTIONS:
+        return "questions exceeds the maximum batch size."
+
+    course_required_strings = ["name", "description", "type", "level"]
+    if not _is_positive_long(course.get("id")):
+        return "course.id must be a positive number."
+    if any(not isinstance(course.get(field), str) for field in course_required_strings):
+        return "course fields must be strings."
+    if not course["name"].strip():
+        return "course.name must not be blank."
+    if course["type"] not in COURSE_CONTENT_COURSE_TYPES:
+        return "course.type must be a valid enum value."
+
+    question_required_fields = {
+        "questionId", "topicId", "topicOrderIndex", "topicName", "topicDescription",
+        "lessonId", "lessonOrderIndex", "lessonTitle", "lessonDescription", "lessonContent",
+        "skillType", "questionOrderIndex", "questionType", "questionText", "correctAnswer", "options",
+    }
+    option_required_fields = {"optionText", "correct", "orderIndex"}
+    question_ids = set()
+    for question in questions:
+        if not isinstance(question, dict):
+            return "questions contains an item with missing fields."
+        if set(question) != question_required_fields:
+            return "questions contains an item with extra or missing fields."
+        if question["skillType"] not in COURSE_CONTENT_SKILL_TYPES or question["questionType"] not in COURSE_CONTENT_QUESTION_TYPES:
+            return "questions contains an invalid enum value."
+        if not isinstance(question, dict) or not question_required_fields.issubset(question):
+            return "questions contains an item with missing fields."
+        question_id = question["questionId"]
+        if not _is_positive_long(question_id):
+            return "questionId must be a positive number."
+        if question_id in question_ids:
+            return "Duplicate questionId values are not allowed."
+        question_ids.add(question_id)
+        if (
+            not _is_positive_long(question["topicId"])
+            or not _is_int(question["topicOrderIndex"])
+            or not _is_positive_long(question["lessonId"])
+            or not _is_int(question["lessonOrderIndex"])
+            or not _is_int(question["questionOrderIndex"])
+            or any(not isinstance(question[field], str) for field in (
+                "topicName", "topicDescription", "lessonTitle", "lessonDescription",
+                "lessonContent", "skillType", "questionType", "questionText", "correctAnswer",
+            ))
+            or not question["questionText"].strip()
+            or not isinstance(question["options"], list)
+        ):
+            return "questions contains an item with invalid field types."
+        options = question["options"]
+        if len(options) > MAX_COURSE_CONTENT_OPTIONS:
+            return "options exceeds the maximum per question."
+        for option in options:
+            if (
+                not isinstance(option, dict)
+                or set(option) != option_required_fields
+                or not isinstance(option["optionText"], str)
+                or not option["optionText"].strip()
+                or not isinstance(option["correct"], bool)
+                or not _is_int(option["orderIndex"])
+            ):
+                return "options contains an item with invalid fields."
+
+    return None
+
+
+def _filter_course_content_response(parsed, requested_question_ids):
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
+        return None
+
+    requested = set(requested_question_ids)
+    seen = set()
+    items = []
+    for item in parsed["items"]:
+        if not isinstance(item, dict):
+            return None
+        question_id = item.get("questionId")
+        knowledge_point = item.get("knowledgePoint")
+        if (
+            not _is_positive_int(question_id)
+            or question_id not in requested
+            or question_id in seen
+        ):
+            return None
+        normalized_knowledge_point = _normalize_knowledge_point(knowledge_point)
+        if normalized_knowledge_point is None:
+            return None
+        seen.add(question_id)
+        items.append({"questionId": question_id, "knowledgePoint": normalized_knowledge_point})
+
+    if seen != requested:
+        return None
+    return {"items": sorted(items, key=lambda item: item["questionId"])}
+
+
+def _normalize_knowledge_point(value):
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    normalized = re.sub(r"[\s-]+", "_", normalized)
+    normalized = re.sub(r"[^a-z0-9_]", "", normalized)
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    if not normalized or len(normalized) > MAX_KNOWLEDGE_POINT_LENGTH:
+        return None
+    return normalized
 
 
 def _filter_learning_path(parsed, allowed_lesson_ids):
@@ -809,6 +975,34 @@ def create_app():
             return jsonify({"error": str(exc)}), 502
 
         return jsonify(tutor_result)
+
+    @app.post("/course-content/enrich-knowledge-points")
+    def enrich_course_content():
+        payload = request.get_json(silent=True)
+        if payload is None:
+            return jsonify({"error": "Request body must be valid JSON"}), 400
+
+        validation_error = _validate_course_content_payload(payload)
+        if validation_error:
+            return jsonify({"error": validation_error}), 400
+
+        prompt = build_course_content_prompt(payload)
+        requested_question_ids = [question["questionId"] for question in payload["questions"]]
+
+        def validate_course_content(parsed):
+            result = _filter_course_content_response(parsed, requested_question_ids)
+            if result is None:
+                raise LlmGenerationError("LLM returned invalid response shape")
+            return result
+
+        try:
+            result = generate_valid_llm_result(prompt, "course_content", validate_course_content)
+        except (json.JSONDecodeError, ValueError, LlmGenerationError):
+            return jsonify({"error": "LLM returned invalid course content metadata"}), 502
+        except LlmConfigurationError as exc:
+            return jsonify({"error": str(exc)}), 503
+
+        return jsonify(result)
 
     return app
 
