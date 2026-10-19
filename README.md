@@ -18,6 +18,33 @@ Flask service for AI-assisted learning path generation.
 - `LLM_COURSE_CONTENT_MODEL`: optional model override for `POST /course-content/enrich-knowledge-points`.
 - `LLM_COURSE_CONTENT_FALLBACK_MODELS`: comma-separated fallback models for course content metadata enrichment.
 - `LLM_TIMEOUT_MS`: outbound timeout for AI Service calls to 9router. Defaults to `8000` in code; Docker examples use `30000` for free models.
+- `LLM_ENRICHMENT_BUDGET_MS`: course enrichment's **total** monotonic generation budget, including all configured fallback models, response parsing, and validation. Defaults to `110000`; must be a positive integer no greater than `110000` (small values are supported for tests). Each attempt is limited to the smaller of `LLM_TIMEOUT_MS` and the remaining total budget.
+- `GUNICORN_TIMEOUT`: production worker watchdog in seconds, default `140`. This is not itself a per-request deadline. Development Compose runs Flask and does not use the Gunicorn watchdog.
+- `AI_SERVICE_INTERNAL_TOKEN`: shared internal service token. When configured, all generation endpoints and course enrichment capabilities require `X-Internal-Service-Token`. Missing or incorrect tokens return `401` before contract selection or body validation. An unset/blank token preserves legacy development access; production must configure this token externally. `/health` remains public.
+
+Course enrichment uses a dedicated HTTP/HTTPS adapter with verified TLS, no redirects,
+debug output disabled, and a 1 MiB response-body limit. Its four daemon I/O workers
+have bounded admission: blocked DNS retains its actual worker slot after the caller
+times out; saturated admission fails promptly without attempting fallback models.
+Cancellation shuts down the owned socket, including stalled HTTP reads or TLS
+handshakes. Native DNS itself cannot be interrupted; after cancellation a late DNS
+result cannot connect or send. The adapter does not use executor exit-time joins.
+Other generation endpoints retain their existing requests transport.
+
+The production timeout layers are **110 seconds** for the total Python enrichment
+budget, **120 seconds** for the dedicated backend HTTP/job deadline, **140 seconds**
+for the Gunicorn worker watchdog, and a **180-second** AI job lease. Short test budgets
+are supported, but production overrides must keep these layers consistent.
+`LLM_TIMEOUT_MS` remains a global per-attempt ceiling, clamped to the remaining total
+enrichment budget; fallback models do not multiply or reset that budget. Metadata
+parsing/validation is pure and bounded, not execution of generated content. Keep raw
+provider diagnostics, request/response payloads and internal tokens out of logs.
+
+Course enrichment errors have static bodies and stable codes: local missing/invalid
+configuration returns `503 ENRICHMENT_CONFIGURATION_UNAVAILABLE`, total deadline
+exhaustion returns `502 ENRICHMENT_DEADLINE_EXCEEDED`, and upstream, response-validation,
+or temporary I/O-capacity failures return `502 ENRICHMENT_GENERATION_FAILED`. Successful
+responses retain `items` and the executed contract version headers.
 
 Fallback model values are comma-separated. Empty entries are ignored, and duplicate models are skipped while preserving order.
 
@@ -145,6 +172,41 @@ Internal endpoint called by the backend when a teacher submits a course for revi
 up to 25 questions per request, then returns one concise `knowledgePoint` label per question. Requests must include the
 `X-Internal-Service-Token` header when `AI_SERVICE_INTERNAL_TOKEN` is configured.
 
+The JSON body remains strictly `course` and `questions` (at most 25 questions); version fields are not accepted in the body.
+Select a contract using **both** `X-Enrichment-Prompt-Version` and `X-Enrichment-Response-Version`.
+Both headers absent selects the legacy pair `("1", "1")`. Versions are canonical positive ASCII numeric strings
+from `1` to `999999999`, without leading zeroes or whitespace. A partial, blank, or malformed pair returns
+`400` with `{"error":"Invalid enrichment contract version headers"}`. A well-formed but unregistered tuple returns
+`409` with `{"code":"ENRICHMENT_CONTRACT_UNSUPPORTED","error":"Unsupported enrichment contract"}`.
+Selection occurs after token authentication and before body validation, so an unsupported tuple with `{}` still returns `409`.
+Neither rejection calls the LLM. Successful responses echo the **executed** pair in those same two headers;
+the `items` body is unchanged. Errors do not echo supplied version headers.
+
+The initial registered tuple is exactly `("1", "1")`, using the existing Flask prompt builder, JSON parsing,
+response validation and label normalization. Only explicitly registered tuples are supported: registering
+`("1", "1")` and `("2", "2")` does not support `("1", "2")`. There is no latest-version fallback.
+Registration is application startup code, never an HTTP API; the registry has no dependency on Flask or providers.
+
+Contract versions are immutable across deployments: do not change a version's prompt or response schema/normalization
+semantics in place. Register new versions for such changes and retain old pairs while backend jobs using them remain active.
+Model routing/fallback order may remain configurable and outputs nondeterministic, but this must not change the prompt
+or schema under an existing version. Before deployment, including AI-only updates,
+verify the **target AI image and every replica** support all active exact pairs. A probe
+of one current load-balanced URL is not proof. Retain required version implementations,
+the backend decryption keyring and database queue through rollback; once future C-phase
+submissions are active, do not roll back to an old writer incompatible with their protocol.
+
+The backend C2 capability gate caches compatibility for AI-only admission after application
+readiness with workers/AI enabled: five-second GET, healthy refresh after 15 seconds,
+failure backoff 5/10/30/60 seconds. Missing support pauses AI, not mail. Required contracts
+are V1 union active database contracts; the lazy source interface exists, but its database
+implementation is pending C3. Capabilities are not LLM-provider health checks. Runtime
+unsupported tuples remain typed failures with no automatic version fallback; C6 owns
+future submission unlock handling. Java and Python wire versions both use
+`[1-9][0-9]{0,8}`; the local policy identifier belongs only to the backend.
+Course background submission/import/UI integration remains future C3–C10 work, with
+no claim of a 1,000-user capacity fix.
+
 Response body:
 
 ```json
@@ -158,5 +220,19 @@ Response body:
 Errors:
 
 - `400`: invalid JSON, missing required course/question fields, duplicate IDs, or a batch larger than 25 questions.
+- `400`: partial, blank, or malformed version headers.
+- `401`: configured internal token is missing or incorrect.
+- `409`: well-formed contract tuple is unsupported (`ENRICHMENT_CONTRACT_UNSUPPORTED`).
 - `503`: `LLM_API_KEY` or an LLM model is not configured.
 - `502`: the LLM call fails or returns malformed, incomplete, duplicate, unknown, blank, or oversized metadata.
+
+### `GET /internal/capabilities/course-enrichment`
+
+Returns stable, numerically sorted **registered tuples**, with no model/provider/key/prompt metadata and no generation:
+
+```json
+{"supportedContracts":[{"promptVersion":"1","responseVersion":"1"}]}
+```
+
+Uses the same internal-token protection and empty-token development behavior as generation endpoints.
+This is an internal service route on the existing service port; it does not add public exposure.

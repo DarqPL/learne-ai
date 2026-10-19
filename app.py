@@ -3,9 +3,13 @@ import json
 import logging
 import os
 import re
+import time
 
 from flask import Flask, jsonify, request
 import requests
+
+from enrichment_contracts import EnrichmentContractRegistry
+import enrichment_http
 
 
 DEFAULT_RECOMMENDATION_REASON = "Recommended based on recent learning history."
@@ -54,6 +58,9 @@ GENERATION_ENDPOINTS = {
     "/ai-tutor/respond",
     "/course-content/enrich-knowledge-points",
 }
+INTERNAL_ENDPOINTS = GENERATION_ENDPOINTS | {"/internal/capabilities/course-enrichment"}
+ENRICHMENT_PROMPT_HEADER = "X-Enrichment-Prompt-Version"
+ENRICHMENT_RESPONSE_HEADER = "X-Enrichment-Response-Version"
 DEFAULT_LLM_BASE_URL = "http://9router:20128/v1"
 DEFAULT_LLM_TIMEOUT_MS = 8000
 DEFAULT_LLM_TEMPERATURE = 0.2
@@ -286,7 +293,18 @@ def _parse_llm_response_text(text):
     return _extract_llm_content(json.loads(stripped))
 
 
-def generate_llm_text(prompt, task_name, model=None):
+def _enrichment_deadline():
+    raw = os.environ.get("LLM_ENRICHMENT_BUDGET_MS", "110000")
+    try:
+        budget = int(raw)
+        if not 0 < budget <= 110000:
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise LlmConfigurationError("Enrichment configuration unavailable") from None
+    return time.monotonic() + budget / 1000
+
+
+def generate_llm_text(prompt, task_name, model=None, deadline=None):
     api_key = os.environ.get("LLM_API_KEY", "").strip()
     if not api_key:
         raise LlmConfigurationError("LLM_API_KEY is required for generation")
@@ -294,6 +312,33 @@ def generate_llm_text(prompt, task_name, model=None):
     selected_model = model or resolve_model(task_name)
     if not selected_model:
         raise LlmConfigurationError("LLM model is required for generation")
+
+    if deadline is not None:
+        enrichment_http.check_deadline(deadline)
+        try:
+            raw = enrichment_http.post_json(
+                _llm_chat_completions_url(),
+                {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                {"model": selected_model, "messages": [{"role": "user", "content": prompt}],
+                 "temperature": DEFAULT_LLM_TEMPERATURE},
+                deadline=min(deadline, time.monotonic() + _llm_timeout_seconds()),
+            )
+            enrichment_http.check_deadline(deadline)
+            text = _parse_llm_response_text(raw)
+            enrichment_http.check_deadline(deadline)
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError()
+            return text
+        except enrichment_http.TransportConfigurationError:
+            raise LlmConfigurationError("Enrichment configuration unavailable") from None
+        except enrichment_http.TransportBusy:
+            raise
+        except enrichment_http.TransportError:
+            enrichment_http.check_deadline(deadline)
+            raise LlmGenerationError("LLM generation failed") from None
+        except (ValueError, RecursionError, LlmGenerationError):
+            enrichment_http.check_deadline(deadline)
+            raise LlmGenerationError("LLM generation failed") from None
 
     try:
         response = requests.post(
@@ -345,7 +390,7 @@ def generate_llm_json(prompt, task_name):
     raise LlmGenerationError("LLM generation failed")
 
 
-def generate_valid_llm_result(prompt, task_name, validate_result):
+def generate_valid_llm_result(prompt, task_name, validate_result, deadline=None):
     models = resolve_models(task_name)
     if not models:
         raise LlmConfigurationError("LLM model is required for generation")
@@ -353,11 +398,31 @@ def generate_valid_llm_result(prompt, task_name, validate_result):
     last_error = None
     for model in models:
         try:
-            parsed = parse_json_response(generate_llm_text(prompt, task_name, model=model))
-            return validate_result(parsed)
+            if deadline is not None:
+                enrichment_http.check_deadline(deadline)
+            kwargs = {"deadline": deadline} if deadline is not None else {}
+            text = generate_llm_text(prompt, task_name, model=model, **kwargs)
+            if deadline is not None:
+                enrichment_http.check_deadline(deadline)
+            try:
+                parsed = parse_json_response(text)
+            except RecursionError:
+                if deadline is None:
+                    raise
+                enrichment_http.check_deadline(deadline)
+                raise LlmGenerationError("LLM generation failed") from None
+            if deadline is not None:
+                enrichment_http.check_deadline(deadline)
+            result = validate_result(parsed)
+            if deadline is not None:
+                enrichment_http.check_deadline(deadline)
+            return result
         except (json.JSONDecodeError, ValueError, LlmGenerationError) as exc:
             last_error = exc
-            logger.warning("LLM model attempt failed task=%s model=%s error=%s", task_name, model, str(exc))
+            if deadline is not None:
+                enrichment_http.check_deadline(deadline)
+            else:
+                logger.warning("LLM model attempt failed task=%s model=%s error=%s", task_name, model, str(exc))
 
     if isinstance(last_error, json.JSONDecodeError):
         raise last_error
@@ -821,11 +886,19 @@ def _filter_ai_tutor_response(parsed):
 def create_app():
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_JSON_BODY_BYTES
+    contracts = EnrichmentContractRegistry()
+    # Resolve Flask-owned functions at invocation time to preserve monkeypatch boundaries.
+    contracts.register(
+        "1", "1",
+        lambda payload: build_course_content_prompt(payload),
+        lambda parsed, requested_ids: _filter_course_content_response(parsed, requested_ids),
+    )
+    app.extensions["enrichment_contracts"] = contracts
 
     @app.before_request
     def require_internal_token():
         expected_token = os.environ.get("AI_SERVICE_INTERNAL_TOKEN", "").strip()
-        if not expected_token or request.path not in GENERATION_ENDPOINTS:
+        if not expected_token or request.path not in INTERNAL_ENDPOINTS:
             return None
 
         provided_token = request.headers.get("X-Internal-Service-Token", "")
@@ -837,6 +910,10 @@ def create_app():
     @app.get("/health")
     def health():
         return jsonify({"status": "ok"})
+
+    @app.get("/internal/capabilities/course-enrichment")
+    def course_enrichment_capabilities():
+        return jsonify({"supportedContracts": contracts.capabilities()})
 
     @app.post("/learning-path/generate")
     def generate_learning_path():
@@ -978,6 +1055,20 @@ def create_app():
 
     @app.post("/course-content/enrich-knowledge-points")
     def enrich_course_content():
+        prompt_version = request.headers.get(ENRICHMENT_PROMPT_HEADER)
+        response_version = request.headers.get(ENRICHMENT_RESPONSE_HEADER)
+        if prompt_version is None and response_version is None:
+            prompt_version, response_version = "1", "1"
+        try:
+            contract = contracts.resolve(prompt_version, response_version)
+        except ValueError:
+            return jsonify({"error": "Invalid enrichment contract version headers"}), 400
+        if contract is None:
+            return jsonify({
+                "code": "ENRICHMENT_CONTRACT_UNSUPPORTED",
+                "error": "Unsupported enrichment contract",
+            }), 409
+
         payload = request.get_json(silent=True)
         if payload is None:
             return jsonify({"error": "Request body must be valid JSON"}), 400
@@ -986,23 +1077,33 @@ def create_app():
         if validation_error:
             return jsonify({"error": validation_error}), 400
 
-        prompt = build_course_content_prompt(payload)
         requested_question_ids = [question["questionId"] for question in payload["questions"]]
 
         def validate_course_content(parsed):
-            result = _filter_course_content_response(parsed, requested_question_ids)
+            result = contract.validate_result(parsed, requested_question_ids)
             if result is None:
                 raise LlmGenerationError("LLM returned invalid response shape")
             return result
 
         try:
-            result = generate_valid_llm_result(prompt, "course_content", validate_course_content)
+            deadline = _enrichment_deadline()
+            prompt = contract.build_prompt(payload)
+            enrichment_http.check_deadline(deadline)
+            result = generate_valid_llm_result(prompt, "course_content", validate_course_content, deadline=deadline)
+            enrichment_http.check_deadline(deadline)
+        except enrichment_http.DeadlineExceeded:
+            return jsonify({"code": "ENRICHMENT_DEADLINE_EXCEEDED", "error": "Enrichment deadline exceeded"}), 502
+        except enrichment_http.TransportBusy:
+            return jsonify({"code": "ENRICHMENT_GENERATION_FAILED", "error": "Enrichment generation failed"}), 502
         except (json.JSONDecodeError, ValueError, LlmGenerationError):
-            return jsonify({"error": "LLM returned invalid course content metadata"}), 502
-        except LlmConfigurationError as exc:
-            return jsonify({"error": str(exc)}), 503
+            return jsonify({"code": "ENRICHMENT_GENERATION_FAILED", "error": "Enrichment generation failed"}), 502
+        except LlmConfigurationError:
+            return jsonify({"code": "ENRICHMENT_CONFIGURATION_UNAVAILABLE", "error": "Enrichment configuration unavailable"}), 503
 
-        return jsonify(result)
+        response = jsonify(result)
+        response.headers[ENRICHMENT_PROMPT_HEADER] = contract.prompt_version
+        response.headers[ENRICHMENT_RESPONSE_HEADER] = contract.response_version
+        return response
 
     return app
 

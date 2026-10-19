@@ -289,7 +289,11 @@ def test_prompt_requires_numeric_lesson_id():
 def _mock_llm_text(monkeypatch, response_text, expected_task=None, prompt_assertion=None):
     monkeypatch.setenv("LLM_DEFAULT_MODEL", "test-model")
 
-    def fake_generate_llm_text(prompt, task_name, model=None):
+    def fake_generate_llm_text(prompt, task_name, model=None, deadline=None):
+        if task_name == "course_content":
+            assert deadline is not None
+        else:
+            assert deadline is None
         if expected_task is not None:
             assert task_name == expected_task
         if prompt_assertion is not None:
