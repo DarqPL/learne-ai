@@ -193,19 +193,38 @@ Model routing/fallback order may remain configurable and outputs nondeterministi
 or schema under an existing version. Before deployment, including AI-only updates,
 verify the **target AI image and every replica** support all active exact pairs. A probe
 of one current load-balanced URL is not proof. Retain required version implementations,
-the backend decryption keyring and database queue through rollback; once future C-phase
-submissions are active, do not roll back to an old writer incompatible with their protocol.
+the backend decryption keyring and database queue through rollback. Active submissions
+must finish under code compatible with their persisted envelopes and course locks.
 
 The backend C2 capability gate caches compatibility for AI-only admission after application
 readiness with workers/AI enabled: five-second GET, healthy refresh after 15 seconds,
 failure backoff 5/10/30/60 seconds. Missing support pauses AI, not mail. Required contracts
-are V1 union active database contracts; the lazy source interface exists, but its database
-implementation is pending C3. Capabilities are not LLM-provider health checks. Runtime
-unsupported tuples remain typed failures with no automatic version fallback; C6 owns
-future submission unlock handling. Java and Python wire versions both use
+are V1 union active database contracts supplied by `SubmissionRepository` from
+`QUEUED`/`PROCESSING` attempts. Capabilities are not LLM-provider health checks. Runtime
+unsupported tuples remain typed failures with no automatic version fallback; backend
+finalization owns terminal state and unlock handling. Java and Python wire versions both use
 `[1-9][0-9]{0,8}`; the local policy identifier belongs only to the backend.
-Course background submission/import/UI integration remains future C3–C10 work, with
-no claim of a 1,000-user capacity fix.
+Course background submission and UI acceptance/status integration are implemented.
+The backend returns 202 for durable acceptance; generation is performed by registered
+workers using the persisted tuple, not replayed through a synchronous endpoint.
+
+For **every deployment, including AI-only image changes**, follow the
+[metadata and cutover runbook](../infra/README.md#r5-queue-cutover-and-rollback).
+Inventory nonterminal queue type/payload versions and active policy/prompt/response
+tuples using operator-supplied current or isolated metadata. Compare the target backend
+registry/local policy/response validators and the **target AI image plus every replica**
+against the full required set, including V1. Probe each private instance directly;
+a health check or one load-balanced capability response does not prove compatibility.
+An incompatible or unverified target blocks cutover. Unknown work stays unclaimed and
+observable through unsupported-version metrics; never relabel persisted versions to
+force admission. Keep old prompt/response implementations and backend crypto keys.
+
+Rollback first stops claims and drains bounded calls while retaining the queue, locks,
+tables and persistent volumes. Use an image that understands active envelopes and locking;
+finish or terminalize them through that implementation before considering older code.
+Never use a synchronous generation bypass, queue deletion or historical replay to roll back.
+The documented Windows/Docker Desktop evidence establishes no native Linux capacity,
+1,000-user support, or adequacy of the production AI **384 MiB** container limit.
 
 Response body:
 
